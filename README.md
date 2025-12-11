@@ -7,7 +7,7 @@
   <a href='https://huggingface.co/datasets/Insta360-Research/Matterport3D_polished'><img src='https://img.shields.io/badge/%F0%9F%93%88%20Hugging%20Face-Dataset-yellow'></a>
 </p>
 
-![teaser](assets/depth_teaser2.pdf)
+![teaser](assets/depth_teaser2_00.png)
 
 
 
