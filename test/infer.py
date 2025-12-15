@@ -98,8 +98,8 @@ def main(config_path, txt_path, out_root):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config/infer.yaml')
-    parser.add_argument('--txt', default='datasets/dit_haoran.txt')
-    parser.add_argument('--output', default='just_try')
+    parser.add_argument('--txt', default='datasets/data.txt')
+    parser.add_argument('--output', default='output')
     parser.add_argument('--gpu', default='0', help='GPU')
     args = parser.parse_args()
 
