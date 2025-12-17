@@ -1,8 +1,18 @@
 # Depth Any Panoramas: A Foundation Model for Panoramic Depth Estimation
 
-[**Xin Lin**](https://linxin0.github.io) · [**Meixi Song**]() · [**Dizhe Zhang**]() · [**Wenxuan Lu**]() · [**Haodong Li**](https://haodong2000.github.io)
-<br>
-[**Bo Du**]() · [**Ming-Hsuan Yang**]() · [**Truong Nguyen**]() · [**Lu Qi**](http://luqi.info)
+<div style="text-align: center;">
+  <a href="https://linxin0.github.io"><b>Xin Lin</b></a> ·
+  <a href=""><b>Meixi Song</b></a> ·
+  <a href=""><b>Dizhe Zhang</b></a> ·
+  <a href=""><b>Wenxuan Lu</b></a> ·
+  <a href="https://haodong2000.github.io"><b>Haodong Li</b></a>
+  <br>
+  <a href=""><b>Bo Du</b></a> ·
+  <a href=""><b>Ming-Hsuan Yang</b></a> ·
+  <a href=""><b>Truong Nguyen</b></a> ·
+  <a href="http://luqi.info"><b>Lu Qi</b></a>
+</div>
+
 
 <p align="center">
   <a href=''><img src='https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white' alt='arXiv'></a>
