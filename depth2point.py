@@ -48,7 +48,7 @@ def save_3d_points(points: np.array, colors: np.array, mask: np.array, filename:
     vertex_data['blue'] = colors[mask, 2]
 
     vertex_element = PlyElement.describe(vertex_data, 'vertex', comments=['point cloud'])
-    PlyData([vertex_element], text=True).write(filename)
+    PlyData([vertex_element], text=False).write(filename)
 
 def depth2pointcloud(depth_path: str, image_path: str, out_ply: str):
     # 读取深度图
@@ -85,6 +85,20 @@ def depth2pointcloud(depth_path: str, image_path: str, out_ply: str):
     print(f"✅ 点云已保存到 {out_ply}")
 
 
+def depth2pointcloud_numpy(depth: np.ndarray, image: np.ndarray, out_ply: str):
+    h, w = depth.shape
+    uv = utils3d.numpy.image_uv(width=w, height=h)   # [H,W,2]
+    dirs = spherical_uv_to_directions(uv)           # [H,W,3]
+    points = depth[..., None] * dirs                # [H,W,3]
+
+    if image.shape[:2] != (h, w):
+        image = cv2.resize(image, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    mask = depth > 0
+    save_3d_points(points, image, mask, out_ply)
+    print(f"✅ 点云已保存到 {out_ply}")
+
+
 def depth2pts(depth):
     # 读取深度图
     depth.squeeze(1) # B,1,H,W -> B,H,W (范围是0-1)
@@ -92,15 +106,15 @@ def depth2pts(depth):
     depth = depth.astype(np.float32)
 
     b, h, w = depth.shape
-    
+
     # 生成UV坐标 [H,W,2]
     uv = utils3d.numpy.image_uv(width=w, height=h)
     # 转换为球面方向 [H,W,3]
     dirs = spherical_uv_to_directions(uv)
-    
+
     # 广播计算3D点云 [B,H,W,3]
     points = depth[..., None] * dirs[None, ...]  # [B,H,W,1] * [1,H,W,3] = [B,H,W,3]
-    
+
     return points
 
 def depth2pts_torch(depth):
@@ -113,24 +127,24 @@ def depth2pts_torch(depth):
     """
     # 确保输入是float32类型
     depth = depth.float()
-    
+
     # 如果输入是 [B, 1, H, W]，则压缩为 [B, H, W]
     if depth.dim() == 4 and depth.shape[1] == 1:
         depth = depth.squeeze(1)  # B,1,H,W -> B,H,W
-    
+
     b, h, w = depth.shape
-    
+
     # 生成UV坐标 [H,W,2]
     uv = utils3d.numpy.image_uv(width=w, height=h)
     # 转换为torch tensor并移动到相同设备
     uv = torch.from_numpy(uv).to(depth.device).to(depth.dtype)
-    
+
     # 转换为球面方向 [H,W,3]
     dirs = spherical_uv_to_directions_torch(uv)
-    
+
     # 广播计算3D点云 [B,H,W,3]
     points = depth[..., None] * dirs[None, ...]  # [B,H,W,1] * [1,H,W,3] = [B,H,W,3]
-    
+
     return points
 
 
@@ -146,6 +160,6 @@ if __name__ == "__main__":
         os.makedirs(path_.replace("rgb", "pts"), exist_ok=True)
         out_ply = os.path.join(path_.replace("rgb", "pts"), file.replace(".png", ".ply"))
         depth2pointcloud(depth_path, image_path, out_ply)
-        
+
     # os.makedirs("output", exist_ok=True)
     # depth2pointcloud(depth_path, image_path, out_ply)

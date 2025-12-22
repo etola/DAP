@@ -3,10 +3,10 @@ import cv2
 import torch
 import torch.nn.functional as F
 from PIL import Image
-import utils3d  # 你原来的工具库
+import utils3d  # Your original utility library
 import os
 # ----------------------------
-# 工具函数
+# Utilities
 # ----------------------------
 def spherical_uv_to_directions(uv: np.ndarray):
     theta, phi = (1 - uv[..., 0]) * (2 * np.pi), uv[..., 1] * np.pi
@@ -61,11 +61,11 @@ def normal_to_rgb(normal: np.ndarray | torch.Tensor, normal_mask: np.ndarray | t
 
 
 # ----------------------------
-# 深度转法线 (numpy版)
+# Depth to normal (NumPy version)
 # ----------------------------
 def depth2normal(depth: np.ndarray, mask: np.ndarray = None, to_rgb: bool = False):
     h, w = depth.shape[:2]
-    # depth → 三维点
+    # depth → 3D points
     points = depth[:, :, None] * spherical_uv_to_directions(utils3d.numpy.image_uv(width=w, height=h))
 
     if mask is None:
@@ -73,11 +73,11 @@ def depth2normal(depth: np.ndarray, mask: np.ndarray = None, to_rgb: bool = Fals
 
     normal, normal_mask = utils3d.numpy.points_to_normals(points, mask)
 
-    # 调整方向 & normalize
+    # Adjust direction & normalize
     normal = normal * np.array([-1, -1, 1])
     normal = normal_normalize(normal)
 
-    # 重排通道 (和你原代码一致)
+    # Reorder channels (same as your original code)
     normal = np.stack([normal[..., 0], normal[..., 2], normal[..., 1]], axis=-1)
 
     if to_rgb:
@@ -87,7 +87,7 @@ def depth2normal(depth: np.ndarray, mask: np.ndarray = None, to_rgb: bool = Fals
 
 
 # ----------------------------
-# 深度转法线 (torch版)
+# Depth to normal (Torch version)
 # ----------------------------
 def depth2normal_torch(depth: torch.Tensor, mask: torch.Tensor = None, to_rgb: bool = False):
     h, w = depth.shape[-2:]
@@ -98,11 +98,11 @@ def depth2normal_torch(depth: torch.Tensor, mask: torch.Tensor = None, to_rgb: b
 
     normal, normal_mask = utils3d.torch.points_to_normals(points, mask)
 
-    # 调整方向
+    # Adjust direction
     normal = normal * torch.tensor([-1, -1, 1], device=normal.device, dtype=normal.dtype)
     normal = normal_normalize_torch(normal)
 
-    # 重排通道
+    # Reorder channels
     normal = torch.stack([normal[..., 0], normal[..., 2], normal[..., 1]], dim=-1)
 
     if to_rgb:
@@ -114,7 +114,7 @@ def depth2normal_torch(depth: torch.Tensor, mask: torch.Tensor = None, to_rgb: b
 
 
 # ----------------------------
-# 主程序
+# Main
 # ----------------------------
 if __name__ == "__main__":
     import argparse
@@ -125,7 +125,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
 
-    #args.img_path是一个文件夹，文件夹中包含多个深度图
+    # args.img_path is a directory containing multiple depth maps
     save_out = os.path.dirname(args.img_path) + '/normal'
     os.makedirs(save_out, exist_ok=True)
     for depth_path in os.listdir(args.img_path):

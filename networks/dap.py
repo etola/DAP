@@ -29,7 +29,7 @@ class DAP(nn.Module):
         }
         
         # Load the pretrained model of depth anything
-        dinov3_repo_dir="./depth_anything_v2_metric/depth_anything_v2/dinov3"     # 你的本地 repo
+        dinov3_repo_dir="./depth_anything_v2_metric/depth_anything_v2/dinov3"     # Your local repo
         dinov3_arch="dinov3_vitl16"          
         dinov3_weight=""
 

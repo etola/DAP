@@ -13,7 +13,9 @@ from tqdm import tqdm
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(PROJECT_ROOT)
 
-from networks.models import make  # 建议用 make，而不是 import *
+from depth2point import depth2pointcloud_numpy
+
+from networks.models import make  # Recommend using make instead of import *
 
 import matplotlib
 
@@ -97,6 +99,9 @@ def infer_and_save(model, device, img_path, out_root, idx, vis_range="100m", cma
 
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+    # resize to 1024 x 512
+    img_rgb = cv2.resize(img_rgb, (1024, 512))
+
     pred = infer_raw(model, device, img_rgb)
 
     depth_gray, depth_color_rgb = pred_to_vis(pred, vis_range=vis_range, cmap=cmap)
@@ -116,6 +121,10 @@ def infer_and_save(model, device, img_path, out_root, idx, vis_range="100m", cma
     cv2.imwrite(gray_png_path, depth_gray)
 
     cv2.imwrite(color_png_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
+
+    # convert the depth map to point cloud and save as ply file
+    depth2pointcloud_numpy(pred, img_rgb, os.path.join(out_root, "pts", filename + ".ply"))
+
 
 
 def main(config_path, txt_path, out_root, vis_range="100m", cmap="Spectral"):
@@ -154,4 +163,9 @@ if __name__ == "__main__":
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    main(args.config, args.txt, args.output, vis_range=args.vis, cmap=args.cmap)
+    out_folder = os.path.abspath(args.output)
+    os.makedirs(out_folder, exist_ok=True)
+    pts_folder = os.path.join(out_folder, "pts")
+    os.makedirs(pts_folder, exist_ok=True)
+
+    main(args.config, args.txt, out_folder, vis_range=args.vis, cmap=args.cmap)

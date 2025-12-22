@@ -122,7 +122,7 @@ class Stanford2D3D(data.Dataset):
 
         val_mask = ((gt_depth > 0) & (gt_depth <= self.max_depth_meters) & ~torch.isnan(gt_depth))
 
-        # 归一化深度值，0.01-1.0
+        # Normalize depth values, 0.01-1.0
         # _min, _max = torch.quantile(gt_depth[val_mask], torch.tensor([0.02, 1 - 0.02]),)
         gt_depth_norm = gt_depth / self.max_depth_meters
         gt_depth_norm = torch.clip(gt_depth_norm, 0.001, 1.0)
@@ -135,12 +135,12 @@ class Stanford2D3D(data.Dataset):
         inputs["normalized_cube_rgb"] = self.normalize(cube_aug_rgb)
 
         inputs["gt_depth"] = gt_depth_norm
-        inputs["val_mask"] = val_mask # 合法区域，不是全true，真把不能用的区域划出来了；其他参与训练的数据集是全true的（除了投影数据集）
+        inputs["val_mask"] = val_mask # Valid region; not all-true — unusable areas are excluded; other training datasets use all-true masks (except the projection dataset)
         inputs["mask_100"] = (gt_depth > 0) & (gt_depth <= 100) 
-        # 对于这个数据集，mask_100设定为全true的，因为求不出来。大于100米的深度gt也有可能是玻璃镜子等物体，反正这个数据集也不参加训练
+        # For this dataset, mask_100 is set to all-true because it cannot be computed. Depth gt beyond 100 meters may include glass/mirror objects; in any case, this dataset is not used for training
         
-        # 这个数据集中，模型预测的mask100应该是被val_mask涵盖的，所以mask100理论上没有影响
-        # val_mask控制计算指标的区域
+        # In this dataset, the predicted mask100 should be covered by val_mask, so mask100 theoretically has no effect
+        # val_mask controls the region where metrics are computed
         return inputs
 
 
