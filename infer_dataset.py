@@ -65,24 +65,24 @@ def save_3d_points(points: np.array, colors: np.array, mask: np.array, filename:
     vertex_element = PlyElement.describe(vertex_data, 'vertex', comments=['point cloud'])
     PlyData([vertex_element], text=False).write(filename)
 
-def process_dataset(dataset_folder, config_path, vis_range="100m", cmap="Spectral"):
+def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral"):
     # Paths
     images_dir = os.path.join(dataset_folder, "images_orig")
     poses_file = os.path.join(dataset_folder, "tum_poses.txt")
     out_folder = os.path.join(dataset_folder, "outfolder")
-    
+
     out_depth_vis = os.path.join(out_folder, "depth_vis")
     out_pts = os.path.join(out_folder, "pts")
-    
+
     os.makedirs(out_depth_vis, exist_ok=True)
     os.makedirs(out_pts, exist_ok=True)
-    
+
     # Load Config and Model
     with open(config_path, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
-    
+
     model, device = load_model(config)
-    
+
     # Read Poses
     poses = []
     with open(poses_file, 'r') as f:
@@ -95,74 +95,74 @@ def process_dataset(dataset_folder, config_path, vis_range="100m", cmap="Spectra
             kf_id = int(float(parts[0]))
             tx, ty, tz = map(float, parts[1:4])
             qx, qy, qz, qw = map(float, parts[4:8])
-            
+
             poses.append({
                 'id': kf_id,
                 't': np.array([tx, ty, tz]),
                 'q': np.array([qx, qy, qz, qw])
             })
-            
+
     print(f"🔹 Found {len(poses)} frames in poses file.")
-    
+
     for pose in tqdm(poses, desc="Processing"):
         kf_id = pose['id']
         filename = f"keyframe_{kf_id:05d}"
         img_name = f"{filename}.jpg"
         img_path = os.path.join(images_dir, img_name)
-        
+
         if not os.path.exists(img_path):
             print(f"⚠️ Image not found: {img_path}")
             continue
-            
+
         # Inference
         img_bgr = cv2.imread(img_path)
         if img_bgr is None:
             print(f"⚠️ Cannot read image: {img_path}")
             continue
-            
+
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        
+
         # Resize to 1024x512 for inference
         original_h, original_w = img_rgb.shape[:2]
         infer_h, infer_w = 512, 1024
         img_input = cv2.resize(img_rgb, (infer_w, infer_h), interpolation=cv2.INTER_LINEAR)
-        
+
         pred_depth = infer_raw(model, device, img_input)
-        
+
         # Visualization
         _, depth_color_rgb = pred_to_vis(pred_depth, vis_range=vis_range, cmap=cmap)
-        
+
         # Save Colored Depth
         vis_path = os.path.join(out_depth_vis, f"{filename}.png")
         cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
-        
+
         # Generate Point Cloud
         # Use predicted depth (which is float32, likely normalized or in meters depending on model/vis)
-        # Assuming pred_depth is metric or scaled consistently. 
+        # Assuming pred_depth is metric or scaled consistently.
         # depth2point.py uses it directly.
-        
+
         h, w = pred_depth.shape
         uv = utils3d.numpy.image_uv(width=w, height=h)
         dirs = spherical_uv_to_directions(uv)
-        
+
         # Back-project to camera frame
         points_cam = pred_depth[..., None] * dirs # [H, W, 3]
-        
+
         # Transform to world frame
         # P_world = R * P_cam + t
         R = quat2mat(pose['q'])
         t = pose['t']
-        
+
         # Apply transformation
         # points_cam is (H, W, 3). Reshape to (H*W, 3) for matrix multiplication
         points_flat = points_cam.reshape(-1, 3)
         points_world_flat = points_flat @ R.T + t
         points_world = points_world_flat.reshape(h, w, 3)
-        
+
         # Save Point Cloud
         mask = pred_depth > 0
         ply_path = os.path.join(out_pts, f"{filename}.ply")
-        
+
         # We need colors for the points. Use the input image (resized)
         # img_input is 1024x512, matching pred_depth resolution
         save_3d_points(points_world, img_input, mask, ply_path)
@@ -171,10 +171,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset_folder", type=str, help="Path to the dataset folder")
     parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config")
-    parser.add_argument("--vis", default="100m", choices=["100m", "10m"], help="Visualization range")
+    parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range")
     parser.add_argument("--cmap", default="Spectral", help="Colormap")
-    
+
     args = parser.parse_args()
-    
+
     process_dataset(args.dataset_folder, args.config, args.vis, args.cmap)
 
