@@ -9,6 +9,8 @@ from tqdm import tqdm
 from plyfile import PlyData, PlyElement
 import utils3d
 
+from pathlib import Path
+
 import colmap_interface
 
 # Add project root and test directory to path
@@ -67,30 +69,28 @@ def save_3d_points(points: np.array, colors: np.array, mask: np.array, filename:
     vertex_element = PlyElement.describe(vertex_data, 'vertex', comments=['point cloud'])
     PlyData([vertex_element], text=False).write(filename)
 
-def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral"):
+def process_dataset(dataset_folder: Path, config_path: str, vis_range="10m", cmap="Spectral"):
     # Paths
-    images_dir = os.path.join(dataset_folder, "images_orig")
-    poses_file = os.path.join(dataset_folder, "tum_poses.txt")
-    out_folder = os.path.join(dataset_folder, "outfolder")
+    out_folder = dataset_folder / "outfolder"
 
-    colmap_folder = os.path.join(dataset_folder, "sparse")
-    if not os.path.exists(colmap_folder):
+    colmap_folder = dataset_folder / "sparse"
+    if not colmap_folder.exists():
         raise FileNotFoundError(f"Colmap folder not found: {colmap_folder}")
 
     # expecting keyframes folder for equirectangular images
-    keyframes_folder = os.path.join(dataset_folder, "keyframes")
-    if not os.path.exists(keyframes_folder):
+    keyframes_folder = dataset_folder / "keyframes"
+    if not keyframes_folder.exists():
         raise FileNotFoundError(f"Keyframes folder not found: {keyframes_folder}")
 
     depth_scale = 10 if vis_range == "10m" else 100
 
-    ci = colmap_interface.ColmapInterface(colmap_folder)
+    ci = colmap_interface.ColmapInterface(dataset_folder, image_folder='images_cubemap')
 
-    out_depth_vis = os.path.join(out_folder, "depth_vis")
-    out_pts = os.path.join(out_folder, "pts")
+    out_depth_vis = out_folder / "depth_vis"
+    out_pts = out_folder / "pts"
 
-    os.makedirs(out_depth_vis, exist_ok=True)
-    os.makedirs(out_pts, exist_ok=True)
+    out_depth_vis.mkdir(parents=True, exist_ok=True)
+    out_pts.mkdir(parents=True, exist_ok=True)
 
     # Load Config and Model
     with open(config_path, "r") as f:
@@ -98,24 +98,23 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
 
     model, device = load_model(config)
 
-
     infer_width = 1024
 
     for fid in tqdm(ci.frame_ids(), desc="Processing"):
 
-        frame_info = ci.frame_info(fid)
+        frame_info = ci.get_frame_info(fid)
 
-        img_name = frame_info['file_name'].basename()
-        img_path = frame_info['file_path']
+        img_path = frame_info['keyframe_path']
+        img_name = img_path.name.split('.')[0]
 
         depth_samples, _sample_ids = ci.spherical_frame_depth_samples(fid, infer_width)
 
-        if not os.path.exists(img_path):
+        if not img_path.exists():
             print(f"⚠️ Image not found: {img_path}")
             continue
 
         # Inference
-        img_bgr = cv2.imread(img_path)
+        img_bgr = cv2.imread(str(img_path))
         if img_bgr is None:
             print(f"⚠️ Cannot read image: {img_path}")
             continue
@@ -123,7 +122,7 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         # Resize to 1024x512 for inference
         original_h, original_w = img_rgb.shape[:2]
-        img_input = cv2.resize(img_rgb, (infer_width, infer_width/2), interpolation=cv2.INTER_LINEAR)
+        img_input = cv2.resize(img_rgb, (infer_width, int(infer_width/2)), interpolation=cv2.INTER_LINEAR)
 
         pred_depth = infer_raw(model, device, img_input) * depth_scale  # Scale depth
 
@@ -167,12 +166,11 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("dataset_folder", type=str, help="Path to the dataset folder")
+    parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
     parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config")
-    parser.add_argument("--vis", default="100m", choices=["100m", "10m"], help="Visualization range")
+    parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range")
     parser.add_argument("--cmap", default="Spectral", help="Colormap")
 
     args = parser.parse_args()
 
-    process_dataset(args.dataset_folder, args.config, args.vis, args.cmap)
-
+    process_dataset(args.dataset, args.config, args.vis, args.cmap)
