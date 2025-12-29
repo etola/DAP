@@ -465,11 +465,8 @@ class ColmapInterface:
         depth_samples = []
         sample_ids = []
 
-<<<<<<< HEAD
         all_points_in_frame = []
 
-=======
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
         sensor_mapping = frame_info['sensor_mapping']
         for sensor_id, img_id in sensor_mapping.items():
             image_info = self.get_image_info(img_id)
@@ -478,10 +475,7 @@ class ColmapInterface:
                 continue
             points_xyz = np.array([self.recon.points3D[pid].xyz for pid in point_ids]).reshape(-1, 3)
             points_in_frame = points_xyz @ R.T + t
-<<<<<<< HEAD
             all_points_in_frame.extend(points_in_frame)
-=======
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
             uv = spherical_img_from_cam((eq_width, eq_width/2), points_in_frame)
             depth = np.linalg.norm(points_in_frame, axis=1)
 
@@ -489,23 +483,15 @@ class ColmapInterface:
                 depth_samples.append(np.array([u, v, d]))
                 sample_ids.append(sensor_id)
 
-<<<<<<< HEAD
 
         all_points_in_frame = np.array(all_points_in_frame)
 
         return depth_samples, sample_ids, all_points_in_frame
-=======
-        return depth_samples, sample_ids
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 
     def render_spherical_frame(self, frame_id: int, eq_image: np.ndarray) -> np.ndarray | None:
 
         eq_width = eq_image.shape[1]
-<<<<<<< HEAD
         depth_samples, sample_ids, _ = self.spherical_frame_depth_samples(frame_id, eq_width)
-=======
-        depth_samples, sample_ids = self.spherical_frame_depth_samples(frame_id, eq_width)
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 
         keys = sorted(list(set(sample_ids)))
 
