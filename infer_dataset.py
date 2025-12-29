@@ -9,11 +9,8 @@ from tqdm import tqdm
 from plyfile import PlyData, PlyElement
 import utils3d
 
-<<<<<<< HEAD
 from pathlib import Path
 
-=======
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 import colmap_interface
 
 # Add project root and test directory to path
@@ -72,7 +69,6 @@ def save_3d_points(points: np.array, colors: np.array, mask: np.array, filename:
     vertex_element = PlyElement.describe(vertex_data, 'vertex', comments=['point cloud'])
     PlyData([vertex_element], text=False).write(filename)
 
-<<<<<<< HEAD
 def compute_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
     """
     Compute similarity transform (rotation, translation, uniform scale) using closed-form solution.
@@ -276,26 +272,10 @@ def process_dataset(dataset_folder: Path, config_path: str, vis_range="10m", cma
     # expecting keyframes folder for equirectangular images
     keyframes_folder = dataset_folder / "keyframes"
     if not keyframes_folder.exists():
-=======
-def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral"):
-    # Paths
-    images_dir = os.path.join(dataset_folder, "images_orig")
-    poses_file = os.path.join(dataset_folder, "tum_poses.txt")
-    out_folder = os.path.join(dataset_folder, "outfolder")
-
-    colmap_folder = os.path.join(dataset_folder, "sparse")
-    if not os.path.exists(colmap_folder):
-        raise FileNotFoundError(f"Colmap folder not found: {colmap_folder}")
-
-    # expecting keyframes folder for equirectangular images
-    keyframes_folder = os.path.join(dataset_folder, "keyframes")
-    if not os.path.exists(keyframes_folder):
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
         raise FileNotFoundError(f"Keyframes folder not found: {keyframes_folder}")
 
     depth_scale = 10 if vis_range == "10m" else 100
 
-<<<<<<< HEAD
     ci = colmap_interface.ColmapInterface(dataset_folder, image_folder='images_cubemap')
 
     out_depth_vis = out_folder / "depth_vis"
@@ -303,15 +283,6 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
 
     out_depth_vis.mkdir(parents=True, exist_ok=True)
     out_pts.mkdir(parents=True, exist_ok=True)
-=======
-    ci = colmap_interface.ColmapInterface(colmap_folder)
-
-    out_depth_vis = os.path.join(out_folder, "depth_vis")
-    out_pts = os.path.join(out_folder, "pts")
-
-    os.makedirs(out_depth_vis, exist_ok=True)
-    os.makedirs(out_pts, exist_ok=True)
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 
     # Load Config and Model
     with open(config_path, "r") as f:
@@ -319,15 +290,10 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
 
     model, device = load_model(config)
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
     infer_width = 1024
 
     for fid in tqdm(ci.frame_ids(), desc="Processing"):
 
-<<<<<<< HEAD
         frame_info = ci.get_frame_info(fid)
 
         img_path = frame_info['keyframe_path']
@@ -336,16 +302,6 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
         sfm_depth_samples, _sample_ids, sfm_points = ci.spherical_frame_depth_samples(fid, infer_width)
 
         if not img_path.exists():
-=======
-        frame_info = ci.frame_info(fid)
-
-        img_name = frame_info['file_name'].basename()
-        img_path = frame_info['file_path']
-
-        depth_samples, _sample_ids = ci.spherical_frame_depth_samples(fid, infer_width)
-
-        if not os.path.exists(img_path):
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
             print(f"⚠️ Image not found: {img_path}")
             continue
 
@@ -358,7 +314,6 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         # Resize to 1024x512 for inference
         original_h, original_w = img_rgb.shape[:2]
-<<<<<<< HEAD
         img_input = cv2.resize(img_rgb, (infer_width, int(infer_width/2)), interpolation=cv2.INTER_LINEAR)
 
         pred_depth = infer_raw(model, device, img_input) * depth_scale  # Scale depth
@@ -368,29 +323,11 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
         picked_iu = uv_samples[..., 0].astype(int)
         picked_iv = uv_samples[..., 1].astype(int)
         pred_depth_samples = pred_depth[picked_iv, picked_iu]
-=======
-        img_input = cv2.resize(img_rgb, (infer_width, infer_width/2), interpolation=cv2.INTER_LINEAR)
-
-        pred_depth = infer_raw(model, device, img_input) * depth_scale  # Scale depth
-
-        # Visualization
-        _, depth_color_rgb = pred_to_vis(pred_depth, vis_range=vis_range, cmap=cmap)
-
-        # Save Colored Depth
-        vis_path = os.path.join(out_depth_vis, f"{img_name}.png")
-        cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
-
-        # Generate Point Cloud
-        # Use predicted depth (which is float32, likely normalized or in meters depending on model/vis)
-        # Assuming pred_depth is metric or scaled consistently.
-        # depth2point.py uses it directly.
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 
         h, w = pred_depth.shape
         uv = utils3d.numpy.image_uv(width=w, height=h)
         dirs = spherical_uv_to_directions(uv)
 
-<<<<<<< HEAD
         picked_dirs = dirs[picked_iv, picked_iu]
         picked_points = pred_depth_samples[..., None] * picked_dirs # [N, 3]
 
@@ -427,11 +364,6 @@ def process_dataset(dataset_folder, config_path, vis_range="10m", cmap="Spectral
         # depth2point.py uses it directly.
 
 
-=======
-        # Back-project to camera frame
-        points_cam = pred_depth[..., None] * dirs # [H, W, 3]
-
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
         # Transform to world frame
         # P_world = R * P_cam + t
         R = frame_info['R']
@@ -457,13 +389,6 @@ if __name__ == "__main__":
     parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config")
     parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range")
     parser.add_argument("--cmap", default="Spectral", help="Colormap")
-<<<<<<< HEAD
-=======
-
-    args = parser.parse_args()
-
-    process_dataset(args.dataset_folder, args.config, args.vis, args.cmap)
->>>>>>> 6029a403c4cdd3de6ea26bdc6df0af5a9b6e0970
 
     args = parser.parse_args()
 
