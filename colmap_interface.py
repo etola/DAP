@@ -75,6 +75,7 @@ class ColmapInterface:
             raise FileNotFoundError(f"Model path {model_path} does not exist")
 
         if not self.image_folder.exists():
+            print(f"Warning: Image folder {image_folder} does not exist")
             raise FileNotFoundError(f"Image folder {image_folder} does not exist")
 
         self.recon = pycolmap.Reconstruction(self.model_path)
@@ -172,7 +173,8 @@ class ColmapInterface:
         if not img_path.exists():
             img_path = self.image_folder / "images_cubemap" / image.name
         if not img_path.exists():
-            raise FileNotFoundError(f"Image {image_id} not found: {image.name}")
+            print(f"Image {image_id} not found: {image.name}")
+            # raise FileNotFoundError(f"Image {image_id} not found: {image.name}")
 
         return {
             "image_id": image_id,
@@ -465,6 +467,8 @@ class ColmapInterface:
         depth_samples = []
         sample_ids = []
 
+        all_points_in_frame = []
+
         sensor_mapping = frame_info['sensor_mapping']
         for sensor_id, img_id in sensor_mapping.items():
             image_info = self.get_image_info(img_id)
@@ -473,6 +477,7 @@ class ColmapInterface:
                 continue
             points_xyz = np.array([self.recon.points3D[pid].xyz for pid in point_ids]).reshape(-1, 3)
             points_in_frame = points_xyz @ R.T + t
+            all_points_in_frame.extend(points_in_frame)
             uv = spherical_img_from_cam((eq_width, eq_width/2), points_in_frame)
             depth = np.linalg.norm(points_in_frame, axis=1)
 
@@ -480,12 +485,15 @@ class ColmapInterface:
                 depth_samples.append(np.array([u, v, d]))
                 sample_ids.append(sensor_id)
 
-        return depth_samples, sample_ids
+
+        all_points_in_frame = np.array(all_points_in_frame)
+
+        return depth_samples, sample_ids, all_points_in_frame
 
     def render_spherical_frame(self, frame_id: int, eq_image: np.ndarray) -> np.ndarray | None:
 
         eq_width = eq_image.shape[1]
-        depth_samples, sample_ids = self.spherical_frame_depth_samples(frame_id, eq_width)
+        depth_samples, sample_ids, _ = self.spherical_frame_depth_samples(frame_id, eq_width)
 
         keys = sorted(list(set(sample_ids)))
 
