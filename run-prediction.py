@@ -1,0 +1,122 @@
+import argparse
+from pathlib import Path
+import yaml
+from tqdm import tqdm
+import cv2
+import os
+import sys
+import numpy as np
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(PROJECT_ROOT)
+sys.path.append(os.path.join(PROJECT_ROOT, 'test'))
+
+from infer_dataset import load_image
+from infer_dataset import depth_map_to_cam_points
+from infer_dataset import save_point_cloud
+try:
+    import infer as infer_module
+    load_model = infer_module.load_model
+    infer_raw = infer_module.infer_raw
+    pred_to_vis = infer_module.pred_to_vis
+except ImportError:
+    # Fallback if test is treated as a package
+    from test import infer as infer_module
+    load_model = infer_module.load_model
+    infer_raw = infer_module.infer_raw
+    pred_to_vis = infer_module.pred_to_vis
+
+
+def process_dataset(conf: dict):
+
+    dataset_folder = conf["dataset"]
+
+    out_folder = dataset_folder / "outfolder"
+    out_folder.mkdir(parents=True, exist_ok=True)
+
+    dmap_folder = out_folder / "pred_dmaps"
+    dmap_folder.mkdir(parents=True, exist_ok=True)
+
+    # expecting keyframes folder for equirectangular images
+    keyframes_folder = dataset_folder / "keyframes"
+    if not keyframes_folder.exists():
+        raise FileNotFoundError(f"Keyframes folder not found: {keyframes_folder}")
+
+    depth_scale = 10 if conf["vis"] == "10m" else 100
+
+    if conf["save_visualization"]:
+        out_depth_vis = out_folder / "depth_vis"
+        out_depth_vis.mkdir(parents=True, exist_ok=True)
+        out_pts = out_folder / "pts"
+        out_pts.mkdir(parents=True, exist_ok=True)
+
+    # Load Config and Model
+    with open(conf["config"], "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+
+    model, device = load_model(config)
+
+    infer_width = conf["infer_width"]
+
+    # get all files under images directory
+    img_files = sorted(list(conf["image_folder"].glob("*.jpg")))
+
+    # split img_files into batches
+    img_batches = [img_files[i:i+conf["batch_size"]] for i in range(0, len(img_files), conf["batch_size"])]
+
+    for img_batch in tqdm(img_batches, desc="Processing"):
+
+        img_inputs = []
+        for img_path in img_batch:
+            img_input = load_image(img_path, infer_width, infer_width//2)
+            img_inputs.append(img_input)
+            img_name = img_path.name.split('.')[0]
+
+        img_inputs = np.stack(img_inputs, axis=0)
+        pred_depths = infer_raw(model, device, img_inputs)
+        for i in range(len(img_batch)):
+            pred_depth = pred_depths[i] * depth_scale
+            img_name = img_batch[i].name.split('.')[0]
+            np.save(dmap_folder / f"{img_name}.npy", pred_depth)
+
+            if conf["save_visualization"]:
+                _, depth_color_rgb = pred_to_vis(pred_depth, vis_range=conf["vis"], cmap=conf["cmap"])
+                vis_path = os.path.join(out_depth_vis, f"{img_name}.png")
+                cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
+
+                cam_points = depth_map_to_cam_points(pred_depth)
+                mask = pred_depth > 0
+                cam_points = cam_points[mask].reshape(-1,3)
+                colors  = img_inputs[i][mask].reshape(-1,3)
+
+                save_point_cloud(cam_points, colors, out_pts / f"{img_name}-raw.ply")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
+    parser.add_argument("--image_folder", "-i", type=Path, default="keyframes", help="Path to the image folder relative to dataset. default [keyframes]")
+    parser.add_argument("--output", "-o", type=Path, default="outfolder", help="Path to the output folder relative to dataset. default [outfolder]")
+    parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
+    parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range, default [10m]")
+    parser.add_argument("--cmap", default="Spectral", help="Colormap name, e.g. default [Spectral], Turbo, Viridis")
+    parser.add_argument("--save_visualization", "-v", action="store_true", help="Save visualizations (default: False) saves dmap and pointcloud")
+    parser.add_argument("--infer_width", type=int, default=1024, help="Inference width, default [1024]")
+    parser.add_argument("--batch_size", "-b", type=int, default=1, help="Batch size, default [1]")
+
+    args = parser.parse_args()
+
+    conf = {
+        "dataset": args.dataset,
+        "out_folder": args.dataset / args.output,
+        "image_folder": args.dataset / args.image_folder,
+        "infer_width": 1024,
+        "config": args.config,
+        "vis": args.vis,
+        "cmap": args.cmap,
+        "save_visualization": args.save_visualization,
+        "batch_size": args.batch_size,
+    }
+
+    process_dataset(conf)
+

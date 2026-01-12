@@ -2,44 +2,29 @@ import os
 import sys
 import cv2
 import numpy as np
-import torch
 import argparse
-import yaml
 from tqdm import tqdm
 from plyfile import PlyData, PlyElement
-import utils3d
-
+import json
+import pickle
 from pathlib import Path
 
 import colmap_interface
+import open3d as o3d
 
-# Add project root and test directory to path
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(PROJECT_ROOT)
-sys.path.append(os.path.join(PROJECT_ROOT, 'test'))
+from parallel_executor import ParallelExecutor
 
-try:
-    import infer as infer_module
-    load_model = infer_module.load_model
-    infer_raw = infer_module.infer_raw
-    pred_to_vis = infer_module.pred_to_vis
-except ImportError:
-    # Fallback if test is treated as a package
-    from test import infer as infer_module
-    load_model = infer_module.load_model
-    infer_raw = infer_module.infer_raw
-    pred_to_vis = infer_module.pred_to_vis
-
-def quat2mat(q):
-    """
-    Convert quaternion [x, y, z, w] to 3x3 rotation matrix.
-    """
-    x, y, z, w = q
-    return np.array([
-        [1 - 2*y**2 - 2*z**2, 2*x*y - 2*z*w, 2*x*z + 2*y*w],
-        [2*x*y + 2*z*w, 1 - 2*x**2 - 2*z**2, 2*y*z - 2*x*w],
-        [2*x*z - 2*y*w, 2*y*z + 2*x*w, 1 - 2*x**2 - 2*y**2]
-    ])
+def load_image(img_path: Path, width: int, height: int):
+    if not img_path.exists():
+        print(f"⚠️ Image not found: {img_path}")
+        return None
+    img_bgr = cv2.imread(str(img_path))
+    if img_bgr is None:
+        print(f"⚠️ Cannot read image: {img_path}")
+        return None
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_input = cv2.resize(img_rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+    return img_input
 
 def spherical_uv_to_directions(uv: np.ndarray):
     theta, phi = (1 - uv[..., 0]) * (2 * np.pi), uv[..., 1] * np.pi
@@ -50,24 +35,60 @@ def spherical_uv_to_directions(uv: np.ndarray):
     ], axis=-1)
     return directions
 
-def save_3d_points(points: np.array, colors: np.array, mask: np.array, filename: str):
+def save_point_cloud(points: np.array, colors: np.array, filename: str):
     points = points.reshape(-1, 3)
     colors = colors.reshape(-1, 3)
-    mask = mask.reshape(-1)
 
-    vertex_data = np.empty(mask.sum(), dtype=[
+    vertex_data = np.empty(len(points), dtype=[
         ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
         ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
     ])
-    vertex_data['x'] = points[mask, 0]
-    vertex_data['y'] = points[mask, 1]
-    vertex_data['z'] = points[mask, 2]
-    vertex_data['red'] = colors[mask, 0]
-    vertex_data['green'] = colors[mask, 1]
-    vertex_data['blue'] = colors[mask, 2]
+    vertex_data['x'] = points[:, 0]
+    vertex_data['y'] = points[:, 1]
+    vertex_data['z'] = points[:, 2]
+    vertex_data['red'] = colors[:, 0]
+    vertex_data['green'] = colors[:, 1]
+    vertex_data['blue'] = colors[:, 2]
 
     vertex_element = PlyElement.describe(vertex_data, 'vertex', comments=['point cloud'])
     PlyData([vertex_element], text=False).write(filename)
+
+def apply_transform(src_pts: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """
+    Apply a similarity transform to a point cloud.
+    The similarity transform maps src_pts to dst_pts: dst_pts = s*R*src_pts + t
+    Args:
+        src_pts: (N, 3) array of source points
+        transform: (4, 4) similarity transformation matrix. Apply this transformation to src_pts to get dst_pts.
+    Returns:
+        dst_pts: (N, 3) array of destination points
+    """
+    if len(src_pts) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    # Check for invalid input points
+    if not np.isfinite(src_pts).all():
+        print("Warning: Input points contain NaN/Inf values")
+        valid_mask = np.isfinite(src_pts).all(axis=1)
+        print(f"  {(~valid_mask).sum()} invalid points out of {len(src_pts)}")
+
+    # Check for invalid transform
+    if not np.isfinite(transform).all():
+        print("Warning: Transform matrix contains NaN/Inf values")
+        print(f"Transform:\n{transform}")
+        raise ValueError("Invalid transform matrix")
+
+    src_pts_homo = np.hstack([src_pts, np.ones((len(src_pts), 1))])
+    dst_pts_homo = (transform @ src_pts_homo.T).T
+    dst_pts = dst_pts_homo[:, :3].copy()
+
+    # Check output for issues
+    if not np.isfinite(dst_pts).all():
+        print("Warning: Transformed points contain NaN/Inf values")
+        valid_mask = np.isfinite(dst_pts).all(axis=1)
+        print(f"  {(~valid_mask).sum()} invalid points out of {len(dst_pts)}")
+
+    return dst_pts
 
 def compute_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
     """
@@ -145,44 +166,6 @@ def compute_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray) -> np
 
     return transform
 
-def apply_transform(src_pts: np.ndarray, transform: np.ndarray) -> np.ndarray:
-    """
-    Apply a similarity transform to a point cloud.
-    The similarity transform maps src_pts to dst_pts: dst_pts = s*R*src_pts + t
-    Args:
-        src_pts: (N, 3) array of source points
-        transform: (4, 4) similarity transformation matrix. Apply this transformation to src_pts to get dst_pts.
-    Returns:
-        dst_pts: (N, 3) array of destination points
-    """
-    if len(src_pts) == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-
-    # Check for invalid input points
-    if not np.isfinite(src_pts).all():
-        print("Warning: Input points contain NaN/Inf values")
-        valid_mask = np.isfinite(src_pts).all(axis=1)
-        print(f"  {(~valid_mask).sum()} invalid points out of {len(src_pts)}")
-
-    # Check for invalid transform
-    if not np.isfinite(transform).all():
-        print("Warning: Transform matrix contains NaN/Inf values")
-        print(f"Transform:\n{transform}")
-        raise ValueError("Invalid transform matrix")
-
-    src_pts_homo = np.hstack([src_pts, np.ones((len(src_pts), 1))])
-    dst_pts_homo = (transform @ src_pts_homo.T).T
-    dst_pts = dst_pts_homo[:, :3].copy()
-
-    # Check output for issues
-    if not np.isfinite(dst_pts).all():
-        print("Warning: Transformed points contain NaN/Inf values")
-        valid_mask = np.isfinite(dst_pts).all(axis=1)
-        print(f"  {(~valid_mask).sum()} invalid points out of {len(dst_pts)}")
-
-    return dst_pts
-
-
 def compute_robust_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray, max_iterations: int = 1000, inlier_threshold: float = 0.1) -> np.ndarray:
     """
     Compute a robust similarity transform from source points to destination points.
@@ -243,6 +226,8 @@ def compute_robust_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray
                     src_pts[inliers],
                     dst_pts[inliers]
                 )
+
+
             else:
                 best_transform = transform
 
@@ -259,140 +244,654 @@ def compute_robust_similarity_transform(src_pts: np.ndarray, dst_pts: np.ndarray
 
     return best_transform
 
+def compute_depth_scale_and_shift(src_depth_samples: np.ndarray, dst_depth_samples: np.ndarray) -> tuple[float, float]:
+    """
+    Compute scale and shift from source depth samples to destination depth samples. The transform maps src_depth_samples
+    to dst_depth_samples: dst_depth_samples = scale * src_depth_samples + shift
+
+    Args:
+        src_depth_samples: Nx1 array of source depth samples
+        dst_depth_samples: Nx1 array of destination depth samples
+    Returns:
+        scale: float
+        shift: float
+    """
+
+    if len(src_depth_samples) != len(dst_depth_samples):
+        raise ValueError("Source and destination depth samples must have the same length")
+    if len(src_depth_samples) < 3 or len(dst_depth_samples) < 3:
+        raise ValueError("Need at least 3 points to compute scale and shift transform")
+
+    # Compute centroids
+    src_centroid = np.mean(src_depth_samples)
+    dst_centroid = np.mean(dst_depth_samples)
+
+    # Center the depth samples
+    src_centered = src_depth_samples - src_centroid
+    dst_centered = dst_depth_samples - dst_centroid
+    src_centered = src_centered.reshape(-1, 1)
+    dst_centered = dst_centered.reshape(-1, 1)
+
+    # Compute scale
+    scale = np.sqrt(np.mean(dst_centered**2, axis=0)) / np.sqrt(np.mean(src_centered**2, axis=0))[0]
+
+    # Compute translation
+    shift = dst_centroid - scale * src_centroid
+
+    return float(scale), float(shift)
+
+def compute_robust_depth_scale_and_shift(src_depth_samples: np.ndarray, dst_depth_samples: np.ndarray, max_iterations: int = 1000, inlier_threshold: float = 0.05) -> tuple[float, float, int]:
+    """
+    Compute robust scale and shift from source depth samples to destination depth samples.
+    Args:
+        src_depth_samples: Nx1 array of source depth samples
+        dst_depth_samples: Nx1 array of destination depth samples
+        max_iterations: maximum RANSAC iterations
+        inlier_threshold: threshold for considering a depth sample as an inlier in terms of abs percentage change wrt destination depth samples
+    Returns:
+        scale: float
+        shift: float
+        inliers: int
+    """
+    N = len(src_depth_samples)
+    if N != len(dst_depth_samples):
+        raise ValueError("Source and destination depth samples must have the same length")
+    if N < 3:
+        raise ValueError("Need at least 3 points to compute scale and shift transform")
+
+    # Check for NaN/Inf in inputs
+    if not np.isfinite(src_depth_samples).all():
+        print("Error: src_depth_samples contains NaN/Inf values")
+        return 1.0, 0.0
+
+    best_inliers = 0
+    best_scale = 1.0
+    best_shift = 0.0
+
+    inlier_set = []
+
+    # RANSAC loop
+    for iteration in range(max_iterations):
+
+        if len(inlier_set) > 0.1*N and iteration < 100:
+            sample_indices = np.random.choice(inlier_set, size=3, replace=False)
+        else:
+            sample_indices = np.random.choice(N, size=3, replace=False)
+
+        src_sample = src_depth_samples[sample_indices]
+        dst_sample = dst_depth_samples[sample_indices]
+
+        # Compute scale and shift from sample
+        scale, shift = compute_depth_scale_and_shift(src_sample, dst_sample)
+
+        # Transform all source depth samples
+        transformed_depth_samples = scale * src_depth_samples + shift
+
+        # compute the error in terms of abs percentage change wrt destination depth samples
+        error = np.abs(transformed_depth_samples - dst_depth_samples) / (dst_depth_samples + 1e-10)
+        inliers = error < inlier_threshold
+        num_inliers = np.sum(inliers)
+        if num_inliers <= 3:
+            continue
+
+        # Update best model if this is better
+        if num_inliers > best_inliers:
+            best_inliers = num_inliers
+            best_scale, best_shift = scale, shift
+            inlier_set = [ k for k in range(N) if inliers[k] ]
+
+            if True: # Refine using all inliers
+                best_scale, best_shift = compute_depth_scale_and_shift(src_depth_samples[inliers], dst_depth_samples[inliers])
+                transformed_depth_samples = best_scale * src_depth_samples + best_shift
+                error = np.abs(transformed_depth_samples - dst_depth_samples) / dst_depth_samples
+                inliers = error < inlier_threshold
+                num_inliers = np.sum(inliers)
+                best_inliers = num_inliers
+                inlier_set = [ k for k in range(N) if inliers[k] ]
 
 
-def process_dataset(dataset_folder: Path, config_path: str, vis_range="10m", cmap="Spectral"):
-    # Paths
-    out_folder = dataset_folder / "outfolder"
+        if best_inliers > 0.98 * N:
+            break
 
-    colmap_folder = dataset_folder / "sparse"
-    if not colmap_folder.exists():
-        raise FileNotFoundError(f"Colmap folder not found: {colmap_folder}")
+    # print(f"RANSAC completed: best inliers = {best_inliers}/{N} ({100*best_inliers/N:.1f}%)")
 
-    # expecting keyframes folder for equirectangular images
-    keyframes_folder = dataset_folder / "keyframes"
-    if not keyframes_folder.exists():
-        raise FileNotFoundError(f"Keyframes folder not found: {keyframes_folder}")
+    return best_scale, best_shift, best_inliers
 
-    depth_scale = 10 if vis_range == "10m" else 100
+def depth_map_to_cam_points(depth_map: np.ndarray) -> np.ndarray:
+    """
+    Convert depth map to camera points.
+    Args:
+        depth_map: (H, W) depth map
+    Returns:
+        camera_points: (H, W, 3) array of camera points
+    """
+    h, w = depth_map.shape
+    u, v = np.meshgrid(np.arange(w), np.arange(h))
+    uvd_full = np.dstack([u, v, depth_map]).reshape(-1, 3)
+    points_cam = colmap_interface.spherical_uvd_to_ray_in_cam(uvd_full, (w, h))
+    return points_cam.reshape(h, w, 3)
 
-    out_depth_vis = out_folder / "depth_vis"
-    out_pts = out_folder / "pts"
+def depth_map_to_world_points(frame_info: dict, depth_map: np.ndarray) -> np.ndarray:
+    """
+    Convert depth map to world points.
+    Args:
+        frame_info: dict of the frame info
+        depth_map: (H, W) depth map
+    Returns:
+        world_points: (H, W, 3) array of world points
+    """
+    cam_points = depth_map_to_cam_points(depth_map).reshape(-1, 3)
+    R = frame_info['R']
+    t = frame_info['t']
+    h, w = depth_map.shape
+    return ((cam_points - t) @ R).reshape(h, w, 3)
 
-    out_depth_vis.mkdir(parents=True, exist_ok=True)
-    out_pts.mkdir(parents=True, exist_ok=True)
+def world_points_to_uvd(world_points: np.ndarray, frame_info: dict, eq_width: int) -> np.ndarray:
+    """
+    Convert world points to uvd coordinates by projecting to the spherical image.
+    Args:
+        world_points: (N, 3) array of world points
+        frame_info: dict of the frame info
+    Returns:
+        uvd: (N, 3) array of uvd coordinates
+    """
+    R = frame_info['R']
+    t = frame_info['t']
+    cam_points = (world_points @ R.T + t).reshape(-1, 3)
+    depth = np.linalg.norm(cam_points, axis=1)
+    uv = colmap_interface.spherical_img_from_cam((eq_width, eq_width//2), cam_points)
+    uvd = np.dstack([uv[:, 0], uv[:, 1], depth]).reshape(-1, 3)
+    return uvd
 
+def register_with_sfm(ci: colmap_interface.ColmapInterface, fid: int, pred_depth: np.ndarray, dmin: float = 0.1, dmax: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Register the predicted depth map using the SfM points and return the world points and the depth map.
+    Args:
+        ci: colmap_interface.ColmapInterface
+        fid: int frame id
+        pred_depth: np.ndarray predicted depth map
+        dmin: float minimum depth
+        dmax: float maximum depth
+    Returns:
+        points_world: (H, W, 3) np.ndarray world points
+        depth_map: (H, W) np.ndarray registered depth map
+    """
 
-    ci = colmap_interface.ColmapInterface(dataset_folder, image_folder='images_cubemap')
-    ci.save_point_cloud(out_folder / "colmap_points.ply")
+    h, w = pred_depth.shape
 
+    # get pred depths for depth_samples
+    sfm_depth_samples, _sample_ids, sfm_points = ci.spherical_frame_depth_samples(fid, w)
+    sfm_depth_samples = np.array(sfm_depth_samples)
 
-    # Load Config and Model
-    with open(config_path, "r") as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
+    mask = (sfm_depth_samples[:, 2] >= dmin) & (sfm_depth_samples[:, 2] <= dmax)
+    sfm_depth_samples = sfm_depth_samples[mask]
 
-    model, device = load_model(config)
+    if len(sfm_depth_samples) < 3:
+        print(f"Not enough sfm depth samples for frame {fid}")
+        return None, None
 
-    infer_width = 1024
+    uv_samples = sfm_depth_samples[:, :2]
+    picked_iu = uv_samples[..., 0].astype(int)
+    picked_iv = uv_samples[..., 1].astype(int)
+    pred_depth_samples = pred_depth[picked_iv, picked_iu]
 
-    for fid in tqdm(ci.frame_ids(), desc="Processing"):
+    scale, shift, inliers = compute_robust_depth_scale_and_shift(pred_depth_samples, sfm_depth_samples[:, 2], max_iterations=1000, inlier_threshold=0.05)
+    if inliers < 30:
+        print(f"Not enough inliers for frame {fid}: {inliers}")
+        return None, None
 
+    if abs(shift) > 0.5:
+        print(f"Shift is too large for frame {fid}: {shift:.4f}")
+        return None, None
+
+    print(f"Scale/Shift/Inliers: {scale:.4f}, {shift:.4f}, {inliers:5d}")
+
+    depth_map = scale * pred_depth + shift
+
+    frame_info = ci.get_frame_info(fid)
+    points_world = depth_map_to_world_points(frame_info, depth_map)
+
+    return points_world, depth_map
+
+def mask_out_edges(mask: np.ndarray, margin: int=3):
+    """
+    Mask out the edges of the mask by setting the edges to 0.
+    Args:
+        mask: (H, W) mask
+        margin: margin width
+    """
+    mask[0:margin, :] = 0
+    mask[-margin:, :] = 0
+    mask[:, 0:margin] = 0
+    mask[:, -margin:] = 0
+    return mask
+
+def mask_out_poles(mask: np.ndarray, margin: int=3):
+    """
+    Mask out the edges of the mask by setting the edges to 0.
+    Args:
+        mask: (H, W) mask
+        margin: margin width
+    """
+    mask[0:margin, :] = 0
+    mask[-margin:, :] = 0
+    return mask
+
+def filter_point_cloud(points: np.ndarray, colors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Filter the point cloud by the density of the points.
+    Args:
+        points: (N, 3) array of points
+        colors: (N, 3) array of colors
+    """
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+
+    # filter out points that are too sparse
+    pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=32, std_ratio=1.6)
+
+    return np.array(pcd.points), np.array(pcd.colors)
+
+def register_depthmaps_to_colmap(ci: colmap_interface.ColmapInterface, conf: dict):
+    # # Paths
+    # for fid in tqdm(ci.frame_ids(), desc="Processing"):
+    #     _register_depthmap_to_colmap(ci, fid, conf)
+
+    def _register_depthmap_to_colmap(fid: int, ci: colmap_interface.ColmapInterface, conf: dict) -> None:
+
+        pred_dmap_folder = conf['pred_dmap_folder']
+        dmap_folder = conf['dmap_folder']
+        keyframe_mask_folder = conf['dataset'] / "keyframe_masks"
+        out_pts = conf['out_pts']
+        out_pts.mkdir(parents=True, exist_ok=True)
+        
         frame_info = ci.get_frame_info(fid)
-
         img_path = frame_info['keyframe_path']
         img_name = img_path.name.split('.')[0]
 
-        sfm_depth_samples, _sample_ids, sfm_points = ci.spherical_frame_depth_samples(fid, infer_width)
+        dmap_file = dmap_folder / f"{img_name}.npy"
+        if dmap_file.exists():
+            return
 
         if not img_path.exists():
             print(f"⚠️ Image not found: {img_path}")
-            continue
+            return
 
-        # Inference
-        img_bgr = cv2.imread(str(img_path))
-        if img_bgr is None:
-            print(f"⚠️ Cannot read image: {img_path}")
-            continue
+        dmap_file = pred_dmap_folder / f"{img_name}.npy"
+        if not dmap_file.exists():
+            print(f"⚠️ Depth map not found: {dmap_file}")
+            return
 
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        # Resize to 1024x512 for inference
-        original_h, original_w = img_rgb.shape[:2]
-        img_input = cv2.resize(img_rgb, (infer_width, int(infer_width/2)), interpolation=cv2.INTER_LINEAR)
-
-        pred_depth = infer_raw(model, device, img_input) * depth_scale  # Scale depth
-
-        # get pred depths for depth_samples
-        uv_samples = np.array(sfm_depth_samples)[:, :2]
-        picked_iu = uv_samples[..., 0].astype(int)
-        picked_iv = uv_samples[..., 1].astype(int)
-        pred_depth_samples = pred_depth[picked_iv, picked_iu]
-
+        pred_depth = np.load(dmap_file)
         h, w = pred_depth.shape
-        uv = utils3d.numpy.image_uv(width=w, height=h)
-        dirs = spherical_uv_to_directions(uv)
+        if w != 2*h:
+            raise ValueError(f"Image width {w} should be twice the height {h} for equirectangulars image")
 
-        picked_dirs = dirs[picked_iv, picked_iu]
-        picked_points = pred_depth_samples[..., None] * picked_dirs # [N, 3]
+        img_mask_path = keyframe_mask_folder / f"{img_name}.png"
+        if not img_mask_path.exists():
+            img_mask = ci.get_spherical_mask_from_cubemap(fid, w, 3)
+            cv2.imwrite(str(img_mask_path), img_mask)
+        else:
+            img_mask = cv2.imread(str(img_mask_path), cv2.IMREAD_GRAYSCALE)
 
-        transform = compute_robust_similarity_transform(picked_points, sfm_points)
+        mask_out_poles(img_mask, margin=5)
+        pred_depth[img_mask == 0] = 0
 
-        n_samples = len(sfm_points)
-        save_3d_points(sfm_points, np.ones((n_samples, 3))*255, np.ones((n_samples, 1)).astype(np.bool), os.path.join(out_pts, f"{img_name}_sfm.ply"))
-        save_3d_points(picked_points, np.ones((n_samples, 3))*255, np.ones((n_samples, 1)).astype(np.bool), os.path.join(out_pts, f"{img_name}_picked.ply"))
+        points_world, depth_map = register_with_sfm(ci, fid, pred_depth, dmin=conf['dmin'], dmax=conf['dmax'])
+        if points_world is None:
+            print(f"No points world for frame {fid}")
+            return
 
+        validity_mask = (depth_map > conf['dmin']) & (depth_map < conf['dmax'])
+        if validity_mask.sum() == 0:
+            print(f"No valid points for frame {fid}")
+            return
 
-        # Back-project to camera frame
-        points_cam = pred_depth[..., None] * dirs # [H, W, 3]
+        depth_map[~validity_mask] = 0
+        np.save(dmap_folder / f"{img_name}.npy", depth_map)
 
-        points_cam_transformed = apply_transform(points_cam.reshape(-1, 3), transform)
-
-        picked_transformed = apply_transform(picked_points.reshape(-1, 3), transform)
-        save_3d_points(picked_transformed, np.ones((n_samples, 3))*255, np.ones((n_samples, 1)).astype(np.bool), os.path.join(out_pts, f"{img_name}_picked_transformed.ply"))
-
-        n_samples = len(points_cam_transformed)
-        save_3d_points(points_cam_transformed, img_input, np.ones((n_samples, 1)).astype(np.bool), os.path.join(out_pts, f"{img_name}_cam_transformed.ply"))
-
-
-
-        # Visualization
-        _, depth_color_rgb = pred_to_vis(pred_depth, vis_range=vis_range, cmap=cmap)
-
-        # Save Colored Depth
-        vis_path = os.path.join(out_depth_vis, f"{img_name}.png")
-        cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
-
-        # Generate Point Cloud
-        # Use predicted depth (which is float32, likely normalized or in meters depending on model/vis)
-        # Assuming pred_depth is metric or scaled consistently.
-        # depth2point.py uses it directly.
+        if conf['save_registered_points']:
+            img = load_image(frame_info['keyframe_path'], w, h)
+            colors = img[validity_mask].reshape(-1, 3)
+            points = points_world[validity_mask].reshape(-1, 3)
+            points, colors = filter_point_cloud(points, colors)
+            save_point_cloud(points, colors, out_pts / f"{img_name}-registered.ply")
 
 
-        # Transform to world frame
-        # P_world = R * P_cam + t
-        R = frame_info['R']
-        t = frame_info['t']
+    parallel_executor = ParallelExecutor(max_workers=4)
+    parallel_executor.run_in_parallel_no_return(_register_depthmap_to_colmap, item_list=ci.frame_ids(), progress_desc="Registering depthmaps to colmap", ci=ci, conf=conf)
 
-        # Apply transformation
-        # points_cam is (H, W, 3). Reshape to (H*W, 3) for matrix multiplication
-        points_flat = points_cam_transformed.reshape(-1, 3)
-        points_world_flat = (points_flat - t) @ R
-        points_world = points_world_flat.reshape(h, w, 3)
 
-        # Save Point Cloud
-        mask = pred_depth > 0
-        ply_path = os.path.join(out_pts, f"{img_name}.ply")
+class Point:
+    def __init__(self, X: np.ndarray, color: np.ndarray, fid: int, u: int, v: int):
+        self.X = X.reshape(-1, 3)
+        self.color = color
+        self.visibility = [fid]
+        self.u = u
+        self.v = v
 
-        # We need colors for the points. Use the input image (resized)
-        # img_input is 1024x512, matching pred_depth resolution
-        save_3d_points(points_world, img_input, mask, ply_path)
+    def add_visibility(self, fid: int):
+        self.visibility.append(fid)
+
+class DepthData:
+
+    def __init__(self, frame_info: dict):
+        self.fid = frame_info['frame_id']
+        self.img_path = frame_info['keyframe_path']
+        self.dmap = None
+        self.img = None
+        self.merged_dmap = None
+        self.valid_mask = None
+        self.exported_mask = None
+        self.neighbor_frame_ids = []
+        self.valid_layers = {} # key: neighbor_fid, value: validity_mask for that neighbor frame
+
+    def set(self, dmap: np.ndarray, neighbor_frame_ids: list[int]):
+        self.dmap = dmap
+        self.img = load_image(self.img_path, dmap.shape[1], dmap.shape[0])
+        self.exported_mask = np.zeros((dmap.shape[0], dmap.shape[1]), dtype=bool)
+        self.neighbor_frame_ids = neighbor_frame_ids
+        self.valid_layers = {} # key: neighbor_fid, value: validity_mask for that neighbor frame
+
+    def image_name(self) -> str:
+        return self.img_path.name.split('.')[0]
+
+    def h(self) -> int:
+        return self.dmap.shape[0]
+
+    def w(self) -> int:
+        return self.dmap.shape[1]
+
+    def save(self, folder: Path): # save depthdata structure
+        with open(self.filename(folder), "wb") as f:
+            pickle.dump(self, f)
+
+    def load(self, folder: Path): # load depthdata structure
+        with open(self.filename(folder), "rb") as f:
+            return pickle.load(f)
+
+    def filename(self, folder: Path = None) -> str:
+        if folder is None:
+            return f"{self.fid}-depthdata.pkl"
+        else:
+            return folder / f"{self.fid}-depthdata.pkl"
+
+
+
+class ValidationManager:
+
+    def __init__(self, ci: colmap_interface.ColmapInterface, conf: dict):
+
+        self.ci = ci
+        self.dmap_folder = conf['dmap_folder']
+        self.out_pts = conf['out_pts']
+        self.depthdata_folder = conf['out_folder'] / "depthdata"
+        self.depthdata_folder.mkdir(parents=True, exist_ok=True)
+
+        self.depth_data = {}
+
+        self.depth_var_th = conf['depth_var_th']
+        self.n_validity_th = conf['n_validity_th']
+        self.n_neighbors = conf['n_neighbors']
+        self.dmin = conf['dmin']
+        self.dmax = conf['dmax']
+
+    def init(self):
+        for fid in tqdm(self.ci.frame_ids(), desc="Initializing depthdata"):
+            frame_info = self.ci.get_frame_info(fid)
+            dd = DepthData(frame_info)
+            if dd.filename(self.depthdata_folder).exists():
+                dd = dd.load(self.depthdata_folder)
+                self.depth_data[fid] = dd
+                continue
+            else:
+                dmap_path = self.dmap_folder / f"{dd.image_name()}.npy"
+                if not dmap_path.exists():
+                    print(f"dmap does not exist {fid}")
+                    continue
+                neighbor_frame_ids = self.ci.find_neighbor_frames(fid, min_points=10)
+                if len(neighbor_frame_ids) < 2:
+                    print(f"Not enough neighbors for frame {fid}")
+                    continue
+                dmap = np.load(dmap_path)
+                dd.set(dmap, neighbor_frame_ids)
+                dd.save(self.depthdata_folder)
+                self.depth_data[fid] = dd
+
+    def save_depthdata(self, fid: int):
+        if fid in self.depth_data:
+            self.depth_data[fid].save(self.depthdata_folder)
+
+    def load_depthdata(self, fid: int):
+        if fid in self.depth_data:
+            return self.depth_data[fid].load(self.depthdata_folder)
+        else:
+            return None
+
+    def validate_depthmap(self, fid: int) -> bool:
+
+        if fid not in self.depth_data:
+            print(f"fid {fid} not in depth data")
+            return False
+
+        fid_data = self.depth_data[fid]
+
+        frame_info = self.ci.get_frame_info(fid)
+        dmap_fid = fid_data.dmap
+
+        mask_fid = (dmap_fid > self.dmin) & (dmap_fid < self.dmax)
+        if mask_fid.sum() == 0:
+            print(f"No valid points for frame {fid}")
+            fid_data.valid_mask = mask_fid
+            return False
+
+        dmap_fid[~mask_fid] = 0
+
+        merged_dmap = dmap_fid.copy()
+
+        neighbor_frame_ids = fid_data.neighbor_frame_ids[:self.n_neighbors]
+
+        validity_counts = np.zeros_like(dmap_fid, dtype=int)
+
+        h, w = dmap_fid.shape
+
+        for neighbor_fid in neighbor_frame_ids:
+            if neighbor_fid not in self.depth_data:
+                # print(f"neighbor {neighbor_fid} not in depth data")
+                continue
+            neighbor_depth_data = self.depth_data[neighbor_fid]
+            neighbor_frame_info = self.ci.get_frame_info(neighbor_fid)
+            neighbor_world_points = depth_map_to_world_points(neighbor_frame_info, neighbor_depth_data.dmap)
+
+            # project the neighbor_world_points to the current frame and check the depth difference
+            uvd = world_points_to_uvd(neighbor_world_points, frame_info, w)
+            iu = uvd[:,0].astype(int)
+            iv = uvd[:,1].astype(int)
+            depth = uvd[:,2].astype(float)
+            fid_depths = dmap_fid[iv, iu]
+            depth_diff_percentage = np.abs(fid_depths - depth) / (depth + 1e-6)
+            valid_depths = depth_diff_percentage < self.depth_var_th
+
+            validity_layer = np.zeros_like(dmap_fid, dtype=bool)
+            validity_layer[iv[valid_depths], iu[valid_depths]] = True
+
+            merged_dmap[ iv[valid_depths], iu[valid_depths] ] += depth[valid_depths]
+
+            fid_data.valid_layers[neighbor_fid] = validity_layer
+
+            validity_counts[ validity_layer ] += 1
+
+        validity_mask = validity_counts >= self.n_validity_th
+        dmap_fid[~validity_mask] = 0
+
+        merged_dmap[validity_mask] /= (validity_counts[validity_mask]+1)
+        merged_dmap[~validity_mask] = 0
+
+        fid_data.valid_mask = validity_mask
+        fid_data.merged_dmap = merged_dmap
+
+        return True
+
+    def get_frame_cloud(self, fid: int):
+        if fid not in self.depth_data:
+            print(f"fid {fid} not in depth data")
+            return None, None
+        fid_data = self.depth_data[fid]
+        if fid_data.merged_dmap is None:
+            print(f"merged dmap is not available for frame {fid}")
+            return None, None
+
+        frame_info = self.ci.get_frame_info(fid)
+
+        validity = fid_data.valid_mask
+        dmap = fid_data.merged_dmap
+        dmap[~validity] = 0
+
+        h, w = dmap.shape
+        points = depth_map_to_world_points(frame_info, dmap)
+        img_input = fid_data.img
+        colors = img_input[validity].reshape(-1, 3)
+        points = points[validity].reshape(-1, 3)
+
+        return points, colors
+
+    def _export_point_cloud(self, fid: int):
+        if fid not in self.depth_data:
+            print(f"fid {fid} not in depth data")
+            return
+        fid_data = self.depth_data[fid]
+        if fid_data.merged_dmap is None:
+            print(f"merged dmap is not available for frame {fid}")
+            return
+
+        frame_info = self.ci.get_frame_info(fid)
+
+        dmap = fid_data.merged_dmap
+        validity_mask = fid_data.valid_mask
+        exported_mask = fid_data.exported_mask
+
+        # disable already exported points
+        validity_mask[exported_mask] = False
+
+        h, w = dmap.shape
+        points = depth_map_to_world_points(frame_info, dmap)
+        img_input = fid_data.img
+
+        pixel_indices = np.argwhere(validity_mask)
+        idx = pixel_indices[:, 0] * w + pixel_indices[:, 1]
+        colors = img_input[validity_mask].reshape(-1, 3)
+        points_valid = points[validity_mask].reshape(-1, 3)
+        point_dict = {
+            k: Point(p, c, fid, x, y)
+            for k, p, c, x, y in zip(idx, points_valid, colors, pixel_indices[:, 1], pixel_indices[:, 0])
+        }
+
+        # extract visibility mask for each neighbor frame
+        for nid,vlayer in fid_data.valid_layers.items():
+            if nid not in self.depth_data:
+                print(f"neighbor {nid} should be in depth data")
+                continue
+            vlayer = validity_mask & vlayer
+
+            pixel_indices = np.argwhere(vlayer)
+            indices = pixel_indices[:, 0] * w + pixel_indices[:, 1]
+
+            for idx in indices:
+                point_dict[idx].add_visibility(nid)
+
+            points_vis = points[vlayer]
+            # project the visible points to the neighbor frame & mark them as exported
+            uvd = world_points_to_uvd(points_vis, self.ci.get_frame_info(nid), w)
+            iu = uvd[:,0].astype(int)
+            iv = uvd[:,1].astype(int)
+            neighbor_depth_data = self.depth_data[nid]
+            neighbor_depth_data.exported_mask[iv, iu] = True
+
+        return point_dict
+
+    def export_point_cloud(self) -> tuple[np.ndarray, np.ndarray]:
+        point_batches = []
+        color_batches = []
+        for fid in tqdm(self.depth_data, desc="Exporting point clouds"):
+            point_dict = self._export_point_cloud(fid)
+            if not point_dict:
+                continue
+            # Stack all points from this frame at once
+            pts = np.vstack([p.X for p in point_dict.values()])
+            cols = np.vstack([p.color for p in point_dict.values()])
+            point_batches.append(pts)
+            color_batches.append(cols)
+
+        points = np.concatenate(point_batches) if point_batches else np.empty((0, 3))
+        colors = np.concatenate(color_batches) if color_batches else np.empty((0, 3))
+        return points, colors
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
-    parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config")
-    parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range")
-    parser.add_argument("--cmap", default="Spectral", help="Colormap")
+    parser.add_argument("--output", "-o", type=Path, default="outfolder", help="Path to the output folder relative to dataset. default [outfolder]")
+    parser.add_argument("--colmap_folder", "-c", type=Path, default="sparse", help="Path to the colmap folder relative to dataset default [sparse]")
+    parser.add_argument("--dmin", type=float, default=0.3, help="Minimum depth, default [0.3]")
+    parser.add_argument("--dmax", type=float, default=7.0, help="Maximum depth, default [7.0]")
+    parser.add_argument("--depth_var_th", type=float, default=0.04, help="Depth variance threshold, default [0.04]")
+    parser.add_argument("--n_validity_th", type=int, default=3, help="Minimum number of valid points, default [3]")
+    parser.add_argument("--n_neighbors", type=int, default=10, help="Number of neighbors, default [10]")
+    parser.add_argument("--save_registered_points", "-r", action="store_true", help="Save registered points (default: False)")
+    parser.add_argument("--save_validated_points", "-v", action="store_true", help="Save validated points (default: False)")
 
     args = parser.parse_args()
 
-    process_dataset(args.dataset, args.config, args.vis, args.cmap)
+    conf = {
+        "dataset": args.dataset,
+        "colmap_folder": args.dataset / args.colmap_folder,
+        "out_folder": args.dataset / args.output,
+        "dmap_folder": args.dataset / args.output / "dmaps",
+        "pred_dmap_folder": args.dataset / args.output / "pred_dmaps",
+        "out_pts": args.dataset / args.output / "pts",
+        "dmin": args.dmin,
+        "dmax": args.dmax,
+        "save_registered_points": args.save_registered_points,
+        "depth_var_th": args.depth_var_th,
+        "n_validity_th": args.n_validity_th,
+        "n_neighbors": args.n_neighbors,
+        "save_validated_points": args.save_validated_points,
+    }
+    if not conf['pred_dmap_folder'].exists():
+        raise FileNotFoundError(f"Predicted depth map folder not found: {conf['pred_dmap_folder']}")
+
+    conf['dmap_folder'].mkdir(parents=True, exist_ok=True)
+    conf['out_pts'].mkdir(parents=True, exist_ok=True)
+
+    if not conf["colmap_folder"].exists():
+        raise FileNotFoundError(f"Colmap folder not found: {conf['colmap_folder']}")
+
+    ci = colmap_interface.ColmapInterface(conf["dataset"], model_path=conf["colmap_folder"].relative_to(conf["dataset"]), image_folder='images_cubemap')
+    ci.save_point_cloud(conf['out_folder'] / "colmap_points.ply")
+
+    register_depthmaps_to_colmap(ci, conf)
+    frame_ids = ci.frame_ids()
+
+    validation_manager = ValidationManager(ci, conf)
+    validation_manager.init()
+
+    for fid in tqdm(frame_ids, desc="Validating depthmaps"):
+        if not validation_manager.validate_depthmap(fid):
+            continue
+        validation_manager.save_depthdata(fid)
+        points, colors = validation_manager.get_frame_cloud(fid)
+        if points is None or colors is None:
+            continue
+
+        if conf['save_validated_points']:
+            img_name = validation_manager.depth_data[fid].image_name()
+            save_point_cloud(points, colors, conf['out_pts'] / f"{img_name}-validated.ply")
+
+    points, colors = validation_manager.export_point_cloud()
+    save_point_cloud(points, colors, conf['out_folder'] / "scene_dense.ply")
+
+    points, colors = filter_point_cloud(points, colors)
+    save_point_cloud(points, colors, conf['out_folder'] / "scene_dense_filtered.ply")
+

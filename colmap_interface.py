@@ -4,6 +4,7 @@ import numpy as np
 import os
 import cv2
 from pathlib import Path
+from parallel_executor import ParallelExecutor
 
 def compute_relative_pose(R1, t1, R2, t2):
     """
@@ -40,7 +41,7 @@ def spherical_img_from_cam(image_size, rays_in_cam: np.ndarray) -> np.ndarray:
     v = (1 - pitch * 2 / np.pi) / 2
     return np.stack([u, v], -1) * image_size
 
-def uvd_to_ray_in_cam(uvd: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
+def spherical_uvd_to_ray_in_cam(uvd: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
     """Convert equirectangular pixel coordinates and depth to 3D rays in camera coordinates.
     Args:
         uvd: (N, 3) array of (u, v, depth) in the equirectangular image
@@ -70,6 +71,7 @@ class ColmapInterface:
         self.workfolder = workfolder.resolve()
         self.model_path = self.workfolder / model_path
         self.image_folder = self.workfolder / image_folder
+        self.pano_face_mask_folder = None
 
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model path {model_path} does not exist")
@@ -77,6 +79,12 @@ class ColmapInterface:
         if not self.image_folder.exists():
             print(f"Warning: Image folder {image_folder} does not exist")
             raise FileNotFoundError(f"Image folder {image_folder} does not exist")
+
+        # panaroma case:
+        if image_folder == "images_cubemap":
+            self.pano_face_mask_folder = self.workfolder / "binary_masks"
+            if not self.pano_face_mask_folder.exists():
+                self.pano_face_mask_folder = None
 
         self.recon = pycolmap.Reconstruction(self.model_path)
         self.n_min_tracks = n_min_tracks
@@ -117,7 +125,10 @@ class ColmapInterface:
             self._cache_image_point_ids()
 
     def frame_ids(self) -> list[int]:
-        return list(self.recon.frames.keys())
+        """
+        Returns the frame ids sorted by the frame id.
+        """
+        return sorted(list(self.recon.frames.keys()))
 
     def image_ids(self) -> list[int]:
         return list(self.recon.images.keys())
@@ -204,6 +215,23 @@ class ColmapInterface:
         }
 
     def get_frame_info(self, frame_id):
+        """
+        Returns the frame information for a given frame id.
+        Args:
+            frame_id: ID of the frame to process
+        Returns:
+            dict: frame information containing:
+                - keyframe_path: path to the keyframe image
+                - rig_id: ID of the rig
+                - frame_id: ID of the frame
+                - image_ids: list of image IDs in the frame
+                - point_ids: list of point IDs in the frame
+                - image_infos: dictionary of image information
+                - sensor_mapping: dictionary of sensor mapping
+                - R: rotation matrix from world to camera coordinates
+                - t: translation vector from world to camera coordinates
+                - c: camera center in world coordinates
+        """
         if frame_id not in self.recon.frames:
             raise ValueError(f"Frame ID {frame_id} not found")
 
@@ -215,12 +243,15 @@ class ColmapInterface:
         image_ids = []
         sensor_mapping = {}
         image_infos = {}
+        point_ids = []
+
         for img_id, sensor_id in frame_images:
             image_ids.append(img_id)
             try:
                 info = self.get_image_info(img_id)
                 info.update({"sensor_id": sensor_id})
                 image_infos[img_id] = info
+                point_ids.extend(info['point_ids'])
                 sensor_mapping[sensor_id] = img_id
             except ValueError:
                 print(f"Warning: Image {img_id} in Frame {frame_id} not found in images")
@@ -240,12 +271,52 @@ class ColmapInterface:
             "rig_id": frame.rig_id,
             "frame_id": frame_id,
             "image_ids": image_ids,
+            "point_ids": point_ids,
             "image_infos": image_infos,
             "sensor_mapping": sensor_mapping, # stores the order of images in the rig
-            "R" : R,
-            "t" : t,
+            "R" : R, # rotation matrix from world to camera coordinates
+            "t" : t, # translation vector from world to camera coordinates
             "c" : -R.T @ t
         }
+
+    def get_joint_points(self, frame_id1: int, frame_id2: int) -> list[int]:
+        """
+        Returns the joint point ids of the two frames.
+        Args:
+            frame_id1: ID of the first frame
+            frame_id2: ID of the second frame
+        Returns:
+            list of joint point ids
+        """
+        frame_info1 = self.get_frame_info(frame_id1)
+        frame_info2 = self.get_frame_info(frame_id2)
+        point_ids1 = frame_info1['point_ids']
+        point_ids2 = frame_info2['point_ids']
+        return list(set(point_ids1) & set(point_ids2))
+
+    def get_joint_points_any(self, frame_id1: int, frame_ids: list[int]) -> list[int]:
+        """
+        Returns the joint points of a single frame with the other frames ie if a point is in frame_id1 and any of the other frames, it is returned.
+        Args:
+            frame_id1: ID of the frame to process
+            frame_ids: list of other frame IDs to compare with
+        Returns:
+            list of joint point ids (unique)
+        """
+        frame_info1 = self.get_frame_info(frame_id1)
+        point_ids1 = set(frame_info1['point_ids'])
+        list_point_ids = []
+
+        for frame_id in frame_ids:
+            frame_info = self.get_frame_info(frame_id)
+            point_ids2 = frame_info['point_ids']
+            list_point_ids.extend(point_ids2)
+
+        list_point_ids = set(list_point_ids)  # remove duplicates
+
+        # now find the points that are in frame_id1 and the list_point_ids
+        joint_point_ids = list(point_ids1 & list_point_ids)
+        return joint_point_ids
 
     def compute_scene_bounding_box(self):
         """
@@ -280,6 +351,31 @@ class ColmapInterface:
             "center": center,
             "extent": extent
         }
+
+    def find_neighbor_frames(self, frame_id: int, min_points: int = 10) -> list[int]:
+        """
+        Finds neighbor frames for a given frame based on shared 3D points.
+        Args:
+            frame_id: ID of the frame to process
+            min_points: Minimum number of shared points to consider an image similar
+        Returns:
+            list of neighbor frame IDs
+        """
+        
+        frame_info = self.get_frame_info(frame_id)
+        shared_point_counts = []
+
+        for fid in self.frame_ids():
+            if fid == frame_id:
+                continue
+            fid_info = self.get_frame_info(fid)
+            n_shared_points = len(set(frame_info['point_ids']) & set(fid_info['point_ids']))
+            if n_shared_points >= min_points:
+                shared_point_counts.append((fid, n_shared_points))
+        shared_point_counts.sort(key=lambda x: x[1], reverse=True)
+        neighbor_frame_ids = [ fid for fid, _ in shared_point_counts ]
+        return neighbor_frame_ids
+
 
     def render_points(self, image_id: int, target_size: int = 1024) -> np.ndarray | None:
         image_info = self.get_image_info(image_id)
@@ -445,6 +541,72 @@ class ColmapInterface:
                 c = colors[i]
                 f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} {int(c[0])} {int(c[1])} {int(c[2])}\n")
 
+    def transfer_to_face_mask(self, image_info: dict, face_mask: np.ndarray, frame_info: dict, eq_mask: np.ndarray, spot_width: int=3):
+        """
+        Transfer the face mask from the cubemap image to the equirectangular image. Operates over 0's of the face_mask and sets the corresponding 0's of the eq_mask.
+        Args:
+            image_info: dict of the image info
+            face_mask: mask for the face of the cubemap image
+            eq_mask: mask for the equirectangular image
+            spot_width: Width of the spot to transfer the mask from the cubemap image to the equirectangular image
+        """
+        
+        K = image_info['K']
+        R = image_info['R']
+
+        # uv coordinates for face_mask > 0:
+        uv_coords = np.where(face_mask == 0)
+        if len(uv_coords[0]) == 0:
+            return
+        # convert uv coordinates to rays in camera coordinates using K and R t
+        K_inv = np.linalg.inv(K)
+        rays_in_cam = K_inv @ np.stack([uv_coords[1], uv_coords[0], np.ones_like(uv_coords[0])], axis=0)
+        rays_in_cam = rays_in_cam / np.linalg.norm(rays_in_cam, axis=0)
+        rays_in_cam = rays_in_cam.T
+
+        rays = rays_in_cam @ R @ frame_info['R'].T
+
+        eq_height, eq_width = eq_mask.shape
+        uv = spherical_img_from_cam((eq_width, eq_width/2), rays)
+        uv = uv.astype(np.int32)
+        mask = (uv[:, 0] >= spot_width) & (uv[:, 0] < eq_width - spot_width) & (uv[:, 1] >= spot_width) & (uv[:, 1] < eq_height - spot_width)
+        uv = uv[mask]
+
+        for u, v in uv:
+            eq_mask[v-spot_width:v+spot_width, u-spot_width:u+spot_width] = 0
+
+    def get_spherical_mask_from_cubemap(self, frame_id: int, eq_width: int, spot_width: int=3) -> np.ndarray:
+        """
+        Get the mask of the spherical image from the frame's cameras. The cubemap images are stored in the frame's image_ids.
+        Args:
+            frame_id: ID of the frame to process
+            eq_width: Width of the equirectangular image (height = width / 2)
+            spot_width: Width of the spot to transfer the mask from the cubemap image to the equirectangular image
+        Returns:
+            mask: (H, W) mask of the spherical image
+        """
+
+        if self.pano_face_mask_folder is None:
+            raise ValueError("Pano face mask folder not found")
+        
+        frame_info = self.get_frame_info(frame_id)
+        image_ids = frame_info['image_ids']
+        if len(image_ids) != 6:
+            raise ValueError(f"Frame {frame_id} has {len(image_ids)} images, expected 6")
+        
+        eq_mask = np.ones((eq_width//2, eq_width), dtype=np.uint8) * 255
+        for img_id in image_ids:
+            image_info = frame_info['image_infos'][img_id]
+            face_mask_path = self.pano_face_mask_folder / f"{image_info['image_name']}.png"
+            face_mask = cv2.imread(str(face_mask_path), cv2.IMREAD_GRAYSCALE)
+
+            # face_mask is a mask for the face of the cubemap image
+            # we need to convert it to a mask for the equirectangular image
+
+            self.transfer_to_face_mask(image_info, face_mask, frame_info, eq_mask, spot_width)
+
+        return eq_mask
+
     def spherical_frame_depth_samples(self, frame_id: int, eq_width: int) -> tuple[list[np.ndarray], list[int]]:
         """
         Generate depth samples for a spherical image from the frame's cameras.
@@ -476,7 +638,7 @@ class ColmapInterface:
             if len(point_ids) == 0:
                 continue
             points_xyz = np.array([self.recon.points3D[pid].xyz for pid in point_ids]).reshape(-1, 3)
-            points_in_frame = points_xyz @ R.T + t
+            points_in_frame = points_xyz @ R.T + t # [N, 3] world to camera coordinates
             all_points_in_frame.extend(points_in_frame)
             uv = spherical_img_from_cam((eq_width, eq_width/2), points_in_frame)
             depth = np.linalg.norm(points_in_frame, axis=1)
@@ -484,7 +646,6 @@ class ColmapInterface:
             for (u, v), d in zip(uv, depth):
                 depth_samples.append(np.array([u, v, d]))
                 sample_ids.append(sensor_id)
-
 
         all_points_in_frame = np.array(all_points_in_frame)
 
@@ -585,7 +746,70 @@ def main():
         else:
             print(f"Failed to project points for frame {frame_id}")
 
+def compute_processing_order(ci: ColmapInterface) -> list[int]:
+    """
+    Compute the processing order of the frames using the most connected frames first and then
+    adding new frames by the number of shared points with the most connected frames. This is implemented 
+    as a greedy algorithm.
+    """
 
+    # initialially generate a list of all frame ids with the number of visible points in each frame
+    frame_ids = ci.frame_ids()
+
+    frame_points = [ [fid, len(ci.get_frame_info(fid)['point_ids'])] for fid in frame_ids ]
+    frame_points = sorted(frame_points, key=lambda x: x[1], reverse=True)
+
+    frame_order = []
+    point_th = frame_points[0][1] * 0.9
+
+    # insert frames that have a similar number of points with the first frame into the frame_order array
+    for frame_id, num_points in frame_points:
+        if num_points > point_th:
+            frame_order.append(frame_id)
+        else:
+            break
+
+    remaining_frame_ids = [ fid for fid in frame_ids if fid not in frame_order ]
+
+    # cache the joint point counts between frames to avoid recomputing them
+    frame_to_frame_counts = {}
+    pairs = []
+    for fid1 in frame_ids:
+        frame_to_frame_counts[fid1] = {}
+        for fid2 in frame_ids:
+            if fid2 <= fid1:
+                continue
+            pairs.append((fid1, fid2))
+
+    def _get_joint_points(frame_pair: tuple[int, int]):
+        fid1, fid2 = frame_pair
+        frame_to_frame_counts[fid1][fid2] = len(ci.get_joint_points(fid1, fid2))
+        frame_to_frame_counts[fid2][fid1] = frame_to_frame_counts[fid1][fid2]
+
+    parallel_executor = ParallelExecutor()
+    parallel_executor.run_in_parallel_no_return(_get_joint_points, item_list=pairs, progress_desc="Computing joint point counts")
+
+    # now iterate over the frame points and add new frames by the number of shared points with the most connected frames
+    while len(remaining_frame_ids) > 0:
+
+        if len(remaining_frame_ids) < 5:
+            frame_order.extend(remaining_frame_ids)
+            break
+
+        # compute the joint point counts with the frames already added to the frame_order array
+        joint_point_counts = [ [fid, sum(frame_to_frame_counts[fid][other_fid] for other_fid in frame_order)] for fid in remaining_frame_ids ]
+        joint_point_counts = sorted(joint_point_counts, key=lambda x: x[1], reverse=True)
+
+        # add the frame with the most shared points to the frame_order array
+        point_count_th = joint_point_counts[0][1] * 0.9
+        for fid, point_count in joint_point_counts:
+            if point_count > point_count_th:
+                frame_order.append(fid)
+                remaining_frame_ids.remove(fid)
+            else:
+                break
+
+    return frame_order
 
 if __name__ == "__main__":
     main()

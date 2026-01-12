@@ -53,11 +53,17 @@ def load_model(config):
 
 def infer_raw(model, device, img_rgb_u8: np.ndarray) -> np.ndarray:
     """
-    img_rgb_u8: HWC uint8 RGB
-    return: pred float32 (H,W)
+    img_rgb_u8: NHWC or HWC uint8 RGB (batch or single image)
+    return: pred float32 (N,H,W) or (H,W)
     """
+    # Handle single image (HWC) by adding batch dimension
+    single_image = img_rgb_u8.ndim == 3
+    if single_image:
+        img_rgb_u8 = img_rgb_u8[np.newaxis, ...]  # Add batch dim: HWC -> NHWC
+
     img = img_rgb_u8.astype(np.float32) / 255.0
-    tensor = torch.from_numpy(img.transpose(2, 0, 1)).unsqueeze(0).to(device)
+    # NHWC -> NCHW
+    tensor = torch.from_numpy(img.transpose(0, 3, 1, 2)).to(device)
 
     with torch.inference_mode():
         outputs = model(tensor)
@@ -67,11 +73,17 @@ def infer_raw(model, device, img_rgb_u8: np.ndarray) -> np.ndarray:
                 mask = 1 - outputs["pred_mask"]
                 mask = mask > 0.5
                 outputs["pred_depth"][~mask] = 1
-            pred = outputs["pred_depth"][0].detach().cpu().squeeze().numpy()
+            pred = outputs["pred_depth"].detach().cpu().squeeze(1).numpy()  # (N,1,H,W) -> (N,H,W)
         else:
-            pred = outputs[0].detach().cpu().squeeze().numpy()
+            pred = outputs.detach().cpu().squeeze(1).numpy()  # (N,1,H,W) -> (N,H,W)
 
-    return pred.astype(np.float32)
+    pred = pred.astype(np.float32)
+
+    # Return single image result without batch dim if input was single
+    if single_image:
+        pred = pred[0]
+
+    return pred
 
 def pred_to_vis(pred: np.ndarray, vis_range: str = "100m", cmap: str = "Spectral"):
     """
