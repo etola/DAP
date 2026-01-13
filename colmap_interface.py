@@ -5,6 +5,18 @@ import os
 import cv2
 from pathlib import Path
 from parallel_executor import ParallelExecutor
+from collections import defaultdict
+
+from scipy.spatial.transform import Rotation
+
+
+def convert_to_quaternion(R: np.ndarray) -> np.ndarray:
+    # Create a Rotation object from the matrix
+    rot = Rotation.from_matrix(R)
+
+    # Get quaternion as [x, y, z, w]
+    return rot.as_quat()
+
 
 def compute_relative_pose(R1, t1, R2, t2):
     """
@@ -239,11 +251,16 @@ class ColmapInterface:
 
         # Extract image IDs from frame data
         frame_images = [(data.id, data.sensor_id.id) for data in frame.data_ids]
+        frame_images.sort(key=lambda x: x[1])
 
         image_ids = []
         sensor_mapping = {}
         image_infos = {}
         point_ids = []
+
+        rig_from_world: pycolmap.Rigid3d = frame.rig_from_world
+        R = rig_from_world.rotation.matrix()
+        t = rig_from_world.translation
 
         for img_id, sensor_id in frame_images:
             image_ids.append(img_id)
@@ -253,6 +270,7 @@ class ColmapInterface:
                 image_infos[img_id] = info
                 point_ids.extend(info['point_ids'])
                 sensor_mapping[sensor_id] = img_id
+
             except ValueError:
                 print(f"Warning: Image {img_id} in Frame {frame_id} not found in images")
 
@@ -262,15 +280,11 @@ class ColmapInterface:
             keyframe_name = first_image_name.split('/')[1]
             keyframe_path = self.workfolder / "keyframes" / keyframe_name
 
-        rig_from_world: pycolmap.Rigid3d = frame.rig_from_world
-        R = rig_from_world.rotation.matrix()
-        t = rig_from_world.translation
-
         return {
             "keyframe_path": keyframe_path,
             "rig_id": frame.rig_id,
             "frame_id": frame_id,
-            "image_ids": image_ids,
+            "image_ids": image_ids, # sorted by the sensor id
             "point_ids": point_ids,
             "image_infos": image_infos,
             "sensor_mapping": sensor_mapping, # stores the order of images in the rig
@@ -810,6 +824,162 @@ def compute_processing_order(ci: ColmapInterface) -> list[int]:
                 break
 
     return frame_order
+
+def pycolmap_image_to_pose(image):
+    """
+    Extract rotation matrix and camera center from pycolmap Image object.
+
+    Args:
+        image: pycolmap.Image object
+
+    Returns:
+        tuple: (R, C) where R is 3x3 rotation matrix and C is camera center
+    """
+    # Get the camera-from-world transform (method call in pycolmap 3.x)
+    cam_from_world = image.cam_from_world()
+
+    # Get rotation matrix
+    R = cam_from_world.rotation.matrix()
+
+    # Get camera center (projection center in world coordinates)
+    C = image.projection_center()
+
+    return R.tolist(), C.tolist()
+
+
+def build_scene_data(reconstruction, verbose=False):
+    """
+    Build scene_data dictionary from pycolmap Reconstruction object.
+
+    This creates the scene_data structure used by SceneInterface.save().
+
+    Args:
+        reconstruction: pycolmap.Reconstruction object
+        verbose: print progress information
+
+    Returns:
+        dict: scene_data dictionary compatible with SceneInterface.save()
+    """
+    # Each COLMAP camera becomes a platform with one camera
+    # Each COLMAP image becomes an image with its own pose
+
+    # Map COLMAP camera_id to platform index
+    camera_to_platform = {}
+    platforms = []
+
+    for camera_id, camera in sorted(reconstruction.cameras.items()):
+        platform_idx = len(platforms)
+        camera_to_platform[camera_id] = platform_idx
+
+        K = camera.calibration_matrix().tolist()
+
+        # Create camera entry for the platform
+        camera_entry = {
+            "name": f"camera_{camera_id}",
+            "bandName": "",
+            "width": camera.width,
+            "height": camera.height,
+            "K": K,
+            "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],  # Identity (camera body frame)
+            "C": [0.0, 0.0, 0.0],  # No offset in camera body frame
+        }
+
+        platform = {
+            "name": f"platform_{camera_id}",
+            "cameras": [camera_entry],
+            "poses": [],  # Poses will be added when processing images
+        }
+
+        platforms.append(platform)
+
+    if verbose:
+        print(
+            f"Created {len(platforms)} platforms from {len(reconstruction.cameras)} cameras"
+        )
+
+    # Map COLMAP image_id to MVS image index and pose index
+    colmap_to_mvs_image = {}
+    images = []
+
+    # Group images by their camera/platform to assign pose indices
+    platform_pose_counts = defaultdict(int)
+
+    for image_id, image in sorted(reconstruction.images.items()):
+        camera_id = image.camera_id
+        platform_idx = camera_to_platform[camera_id]
+
+        # Extract pose (rotation and camera center)
+        R, C = pycolmap_image_to_pose(image)
+
+        # Add pose to the platform
+        pose = {"R": R, "C": C}
+        pose_idx = platform_pose_counts[platform_idx]
+        platforms[platform_idx]["poses"].append(pose)
+        platform_pose_counts[platform_idx] += 1
+
+        mvs_image_idx = len(images)
+        colmap_to_mvs_image[image_id] = mvs_image_idx
+
+        image_entry = {
+            "name": image.name,
+            "maskName": "",
+            "platformID": platform_idx,
+            "cameraID": 0,  # Each platform has only one camera
+            "poseID": pose_idx,
+            "ID": mvs_image_idx,
+            "minDepth": 0.0,
+            "avgDepth": 0.0,
+            "maxDepth": 0.0,
+            "viewScores": [],
+        }
+
+        images.append(image_entry)
+
+    if verbose:
+        print(f"Created {len(images)} images from COLMAP reconstruction")
+
+    # Build vertices from 3D points
+    vertices = []
+    vertices_color = []
+
+    for _point3d_id, point3d in sorted(reconstruction.points3D.items()):
+        # Build views list from track
+        views = []
+        for track_elem in point3d.track.elements:
+            image_id = track_elem.image_id
+            if image_id in colmap_to_mvs_image:
+                mvs_image_id = colmap_to_mvs_image[image_id]
+                views.append({"imageID": mvs_image_id, "confidence": 1.0})
+
+        xyz = point3d.xyz.tolist()
+        vertex = {"X": xyz, "views": views}
+
+        # Convert RGB to BGR for MVS format
+        rgb = point3d.color.tolist()
+        color = {"c": [rgb[2], rgb[1], rgb[0]]}  # BGR
+
+        vertices.append(vertex)
+        vertices_color.append(color)
+
+    if verbose:
+        print(f"Created {len(vertices)} 3D points")
+
+    # Build scene_data
+    scene_data = {
+        "platforms": platforms,
+        "images": images,
+        "vertices": vertices,
+        "verticesNormal": [],  # No normals from COLMAP
+        "verticesColor": vertices_color,
+        "lines": [],
+        "linesNormal": [],
+        "linesColor": [],
+        "transform": [],  # No transform
+        "obb": {},  # No OBB
+    }
+
+    return scene_data
+
 
 if __name__ == "__main__":
     main()

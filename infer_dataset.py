@@ -8,10 +8,11 @@ from plyfile import PlyData, PlyElement
 import json
 import pickle
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import colmap_interface
 import open3d as o3d
-
+from mvs_interface import SceneInterface
 from parallel_executor import ParallelExecutor
 
 def load_image(img_path: Path, width: int, height: int):
@@ -386,7 +387,7 @@ def depth_map_to_world_points(frame_info: dict, depth_map: np.ndarray) -> np.nda
     h, w = depth_map.shape
     return ((cam_points - t) @ R).reshape(h, w, 3)
 
-def world_points_to_uvd(world_points: np.ndarray, frame_info: dict, eq_width: int) -> np.ndarray:
+def world_points_to_uvd_in_spherical(world_points: np.ndarray, frame_info: dict, eq_width: int) -> np.ndarray:
     """
     Convert world points to uvd coordinates by projecting to the spherical image.
     Args:
@@ -637,6 +638,9 @@ class ValidationManager:
         self.n_neighbors = conf['n_neighbors']
         self.dmin = conf['dmin']
         self.dmax = conf['dmax']
+        self.map_w = 0 # width of the equirectangular image
+
+        self.face_id_map: np.ndarray = None # stores the face id for each pixel in the equirectangular image
 
     def init(self):
         for fid in tqdm(self.ci.frame_ids(), desc="Initializing depthdata"):
@@ -659,6 +663,56 @@ class ValidationManager:
                 dd.set(dmap, neighbor_frame_ids)
                 dd.save(self.depthdata_folder)
                 self.depth_data[fid] = dd
+
+        for dd in self.depth_data.values():
+            if dd.dmap is not None:
+                self.map_w = dd.w()
+                break
+
+        if self.map_w == 0:
+            raise ValueError("Width of the equirectangular image is not set")
+
+        self.compute_frame_to_face_id_mapping()
+
+    def compute_frame_to_face_id_mapping(self):
+
+        """
+        compute the mapping for the image_id visibility for the equirectangular images. ie, for each 
+        u, v coordinate in the equirectangular image, find the image_id that can see the point.
+        mapping is the same for all frames as we assume all the images are capture by the same rig of cameras.
+        """
+
+        self.face_id_map = np.zeros((self.map_w//2, self.map_w), dtype=int)
+
+        # pick the first frame and compute the image_id_map
+        frame_info = self.ci.get_frame_info(self.ci.frame_ids()[0])
+        image_infos = frame_info['image_infos']
+
+        u, v = np.meshgrid(np.arange(self.map_w//2), np.arange(self.map_w))
+        uv = np.stack([u.flatten(), v.flatten()], axis=1)
+        # get world points for the uv coordinates
+        world_points = depth_map_to_world_points(frame_info, np.ones((self.map_w//2, self.map_w)))
+
+        # project the world points to the image plane and get the image_id that can see the point
+        for face_id in range(len(frame_info['image_ids'])):
+            image_id = frame_info['image_ids'][face_id]
+            image_info = image_infos[image_id]
+
+            K = image_info['K']
+            R = image_info['R']
+            t = image_info['t']
+            
+            # project onto the image plane
+            cam_points = (world_points.reshape(-1, 3) @ R.T + t).reshape(-1, 3)
+            uv_proj = K @ cam_points.T
+            depth = uv_proj[2, :]
+            uv_proj = uv_proj[:2, :] / (depth[np.newaxis, :] + 1e-6)
+
+            # check if the point is in the image and not behind the camera
+            mask = (uv_proj[0, :] >= 0) & (uv_proj[0, :] < self.map_w) & (uv_proj[1, :] >= 0) & (uv_proj[1, :] < self.map_w//2) & (depth > 0)
+            mask = mask.reshape(self.map_w//2, self.map_w)
+
+            self.face_id_map[mask] = face_id
 
     def save_depthdata(self, fid: int):
         if fid in self.depth_data:
@@ -706,7 +760,7 @@ class ValidationManager:
             neighbor_world_points = depth_map_to_world_points(neighbor_frame_info, neighbor_depth_data.dmap)
 
             # project the neighbor_world_points to the current frame and check the depth difference
-            uvd = world_points_to_uvd(neighbor_world_points, frame_info, w)
+            uvd = world_points_to_uvd_in_spherical(neighbor_world_points, frame_info, w)
             iu = uvd[:,0].astype(int)
             iv = uvd[:,1].astype(int)
             depth = uvd[:,2].astype(float)
@@ -798,12 +852,17 @@ class ValidationManager:
             pixel_indices = np.argwhere(vlayer)
             indices = pixel_indices[:, 0] * w + pixel_indices[:, 1]
 
-            for idx in indices:
-                point_dict[idx].add_visibility(nid)
+            face_ids = self.face_id_map[pixel_indices[:, 0], pixel_indices[:, 1]]
+
+            nid_info = self.ci.get_frame_info(nid)
+
+            for idx, face_id in zip(indices, face_ids):
+                nid_image_id = nid_info['image_ids'][face_id]
+                point_dict[idx].add_visibility(nid_image_id)
 
             points_vis = points[vlayer]
             # project the visible points to the neighbor frame & mark them as exported
-            uvd = world_points_to_uvd(points_vis, self.ci.get_frame_info(nid), w)
+            uvd = world_points_to_uvd_in_spherical(points_vis, self.ci.get_frame_info(nid), w)
             iu = uvd[:,0].astype(int)
             iv = uvd[:,1].astype(int)
             neighbor_depth_data = self.depth_data[nid]
@@ -812,21 +871,146 @@ class ValidationManager:
         return point_dict
 
     def export_point_cloud(self) -> tuple[np.ndarray, np.ndarray]:
-        point_batches = []
-        color_batches = []
+        point_dicts = []
         for fid in tqdm(self.depth_data, desc="Exporting point clouds"):
             point_dict = self._export_point_cloud(fid)
             if not point_dict:
                 continue
-            # Stack all points from this frame at once
+            point_dicts.append(point_dict)
+        return point_dicts
+
+    def extract_points_and_colors(self, point_dicts: list[dict]) -> tuple[np.ndarray, np.ndarray]:
+        point_batches = []
+        color_batches = []
+        for point_dict in point_dicts:
             pts = np.vstack([p.X for p in point_dict.values()])
             cols = np.vstack([p.color for p in point_dict.values()])
             point_batches.append(pts)
             color_batches.append(cols)
+        return np.concatenate(point_batches) if point_batches else np.empty((0, 3)), np.concatenate(color_batches) if color_batches else np.empty((0, 3))
 
-        points = np.concatenate(point_batches) if point_batches else np.empty((0, 3))
-        colors = np.concatenate(color_batches) if color_batches else np.empty((0, 3))
-        return points, colors
+    def build_scene_data(self, point_dicts: list[dict]) -> dict:
+        """
+        Build scene_data dictionary from point_dicts with image_id visibility.
+        
+        Args:
+            point_dicts: list of point dictionaries where each point has visibility
+                        as a list of colmap image_ids (use convert_visibility_to_image_ids first)
+            
+        Returns:
+            dict: scene_data dictionary compatible with SceneInterface.save()
+        """
+        # Build platform and image mappings from colmap reconstruction
+        # Each COLMAP camera becomes a platform with one camera
+        camera_to_platform = {}
+        platforms = []
+        
+        for camera_id, camera in sorted(self.ci.recon.cameras.items()):
+            platform_idx = len(platforms)
+            camera_to_platform[camera_id] = platform_idx
+            
+            K = camera.calibration_matrix().tolist()
+            
+            camera_entry = {
+                "name": f"camera_{camera_id}",
+                "bandName": "",
+                "width": camera.width,
+                "height": camera.height,
+                "K": K,
+                "R": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                "C": [0.0, 0.0, 0.0],
+            }
+            
+            platform = {
+                "name": f"platform_{camera_id}",
+                "cameras": [camera_entry],
+                "poses": [],
+            }
+            platforms.append(platform)
+        
+        # Build image list and mapping from colmap image_id to mvs image index
+        colmap_to_mvs_image = {}
+        images = []
+        platform_pose_counts = {}
+        
+        for image_id, image in sorted(self.ci.recon.images.items()):
+            camera_id = image.camera_id
+            platform_idx = camera_to_platform[camera_id]
+            
+            # Extract pose (rotation and camera center)
+            pose = image.cam_from_world()
+            R = pose.rotation.matrix()
+            t = pose.translation
+            C = (-R.T @ t).tolist()
+            R = R.tolist()
+            
+            # Add pose to platform
+            pose_entry = {"R": R, "C": C}
+            if platform_idx not in platform_pose_counts:
+                platform_pose_counts[platform_idx] = 0
+            pose_idx = platform_pose_counts[platform_idx]
+            platforms[platform_idx]["poses"].append(pose_entry)
+            platform_pose_counts[platform_idx] += 1
+            
+            mvs_image_idx = len(images)
+            colmap_to_mvs_image[image_id] = mvs_image_idx
+            
+            image_entry = {
+                "name": image.name,
+                "maskName": "",
+                "platformID": platform_idx,
+                "cameraID": 0,
+                "poseID": pose_idx,
+                "ID": mvs_image_idx,
+                "minDepth": 0.0,
+                "avgDepth": 0.0,
+                "maxDepth": 0.0,
+                "viewScores": [],
+            }
+            images.append(image_entry)
+        
+        # Build vertices from point_dicts (visibility already in image_ids)
+        vertices = []
+        vertices_color = []
+        
+        for point_dict in tqdm(point_dicts, desc="Building scene vertices"):
+            for point in point_dict.values():
+                # Build views from image_id visibility
+                views = []
+                for img_id in point.visibility:
+                    if img_id in colmap_to_mvs_image:
+                        mvs_img_id = colmap_to_mvs_image[img_id]
+                        views.append({"imageID": mvs_img_id, "confidence": 1.0})
+                
+                xyz = point.X.flatten().tolist()
+                vertex = {"X": xyz, "views": views}
+                
+                # Convert RGB to BGR for MVS format
+                rgb = point.color.flatten().tolist()
+                if len(rgb) >= 3:
+                    color = {"c": [int(rgb[2]), int(rgb[1]), int(rgb[0])]}  # BGR
+                else:
+                    color = {"c": [128, 128, 128]}
+                
+                vertices.append(vertex)
+                vertices_color.append(color)
+        
+        # Build scene_data
+        scene_data = {
+            "platforms": platforms,
+            "images": images,
+            "vertices": vertices,
+            "verticesNormal": [],
+            "verticesColor": vertices_color,
+            "lines": [],
+            "linesNormal": [],
+            "linesColor": [],
+            "transform": [],
+            "obb": {},
+        }
+        
+        return scene_data
+
 
 
 if __name__ == "__main__":
@@ -889,9 +1073,14 @@ if __name__ == "__main__":
             img_name = validation_manager.depth_data[fid].image_name()
             save_point_cloud(points, colors, conf['out_pts'] / f"{img_name}-validated.ply")
 
-    points, colors = validation_manager.export_point_cloud()
+    point_dicts = validation_manager.export_point_cloud()
+
+    points, colors = validation_manager.extract_points_and_colors(point_dicts)
     save_point_cloud(points, colors, conf['out_folder'] / "scene_dense.ply")
 
-    points, colors = filter_point_cloud(points, colors)
-    save_point_cloud(points, colors, conf['out_folder'] / "scene_dense_filtered.ply")
+    scene_data = validation_manager.build_scene_data(point_dicts)
+    SceneInterface.save(conf['out_folder'] / "scene_dense.mvs", scene_data)
+
+    # points, colors = filter_point_cloud(points, colors)
+    # save_point_cloud(points, colors, conf['out_folder'] / "scene_dense_filtered.ply")
 
