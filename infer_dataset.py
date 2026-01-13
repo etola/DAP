@@ -8,7 +8,6 @@ from plyfile import PlyData, PlyElement
 import json
 import pickle
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import colmap_interface
 import open3d as o3d
@@ -870,38 +869,14 @@ class ValidationManager:
 
         return point_dict
 
-    def export_point_cloud(self) -> tuple[np.ndarray, np.ndarray]:
-        point_dicts = []
-        for fid in tqdm(self.depth_data, desc="Exporting point clouds"):
-            point_dict = self._export_point_cloud(fid)
-            if not point_dict:
-                continue
-            point_dicts.append(point_dict)
-        return point_dicts
-
-    def extract_points_and_colors(self, point_dicts: list[dict]) -> tuple[np.ndarray, np.ndarray]:
-        point_batches = []
-        color_batches = []
-        for point_dict in point_dicts:
-            pts = np.vstack([p.X for p in point_dict.values()])
-            cols = np.vstack([p.color for p in point_dict.values()])
-            point_batches.append(pts)
-            color_batches.append(cols)
-        return np.concatenate(point_batches) if point_batches else np.empty((0, 3)), np.concatenate(color_batches) if color_batches else np.empty((0, 3))
-
-    def build_scene_data(self, point_dicts: list[dict]) -> dict:
+    def _init_scene_data(self) -> tuple[dict, dict]:
         """
-        Build scene_data dictionary from point_dicts with image_id visibility.
+        Initialize scene_data with platforms, images, and empty vertices.
         
-        Args:
-            point_dicts: list of point dictionaries where each point has visibility
-                        as a list of colmap image_ids (use convert_visibility_to_image_ids first)
-            
         Returns:
-            dict: scene_data dictionary compatible with SceneInterface.save()
+            tuple of (scene_data, colmap_to_mvs_image mapping)
         """
         # Build platform and image mappings from colmap reconstruction
-        # Each COLMAP camera becomes a platform with one camera
         camera_to_platform = {}
         platforms = []
         
@@ -969,39 +944,13 @@ class ValidationManager:
             }
             images.append(image_entry)
         
-        # Build vertices from point_dicts (visibility already in image_ids)
-        vertices = []
-        vertices_color = []
-        
-        for point_dict in tqdm(point_dicts, desc="Building scene vertices"):
-            for point in point_dict.values():
-                # Build views from image_id visibility
-                views = []
-                for img_id in point.visibility:
-                    if img_id in colmap_to_mvs_image:
-                        mvs_img_id = colmap_to_mvs_image[img_id]
-                        views.append({"imageID": mvs_img_id, "confidence": 1.0})
-                
-                xyz = point.X.flatten().tolist()
-                vertex = {"X": xyz, "views": views}
-                
-                # Convert RGB to BGR for MVS format
-                rgb = point.color.flatten().tolist()
-                if len(rgb) >= 3:
-                    color = {"c": [int(rgb[2]), int(rgb[1]), int(rgb[0])]}  # BGR
-                else:
-                    color = {"c": [128, 128, 128]}
-                
-                vertices.append(vertex)
-                vertices_color.append(color)
-        
-        # Build scene_data
+        # Initialize scene_data with empty vertices
         scene_data = {
             "platforms": platforms,
             "images": images,
-            "vertices": vertices,
+            "vertices": [],
             "verticesNormal": [],
-            "verticesColor": vertices_color,
+            "verticesColor": [],
             "lines": [],
             "linesNormal": [],
             "linesColor": [],
@@ -1009,6 +958,126 @@ class ValidationManager:
             "obb": {},
         }
         
+        return scene_data, colmap_to_mvs_image
+
+    def _export_frame_to_scene(self, fid: int, scene_data: dict, colmap_to_mvs_image: dict) -> int:
+        """
+        Export a single frame's points directly into scene_data vertices.
+        
+        Args:
+            fid: frame id to export
+            scene_data: scene_data dictionary to append vertices to
+            colmap_to_mvs_image: mapping from colmap image_id to mvs image index
+            
+        Returns:
+            number of points exported
+        """
+        if fid not in self.depth_data:
+            return 0
+        fid_data = self.depth_data[fid]
+        if fid_data.merged_dmap is None:
+            return 0
+
+        frame_info = self.ci.get_frame_info(fid)
+
+        dmap = fid_data.merged_dmap
+        validity_mask = fid_data.valid_mask.copy()
+        exported_mask = fid_data.exported_mask
+
+        # disable already exported points
+        validity_mask[exported_mask] = False
+
+        h, w = dmap.shape
+        points = depth_map_to_world_points(frame_info, dmap)
+        img_input = fid_data.img
+
+        pixel_indices = np.argwhere(validity_mask)
+        if len(pixel_indices) == 0:
+            return 0
+            
+        idx_array = pixel_indices[:, 0] * w + pixel_indices[:, 1]
+        colors = img_input[validity_mask].reshape(-1, 3)
+        points_valid = points[validity_mask].reshape(-1, 3)
+        
+        # Build visibility for each point: start with empty lists
+        # Each point starts with visibility from current frame's images
+        n_points = len(idx_array)
+        point_visibility = [[] for _ in range(n_points)]
+        
+        # Map from idx to position in our arrays
+        idx_to_pos = {idx: pos for pos, idx in enumerate(idx_array)}
+
+        # Extract visibility mask for each neighbor frame
+        for nid, vlayer in fid_data.valid_layers.items():
+            if nid not in self.depth_data:
+                continue
+            vlayer = validity_mask & vlayer
+
+            vis_pixel_indices = np.argwhere(vlayer)
+            if len(vis_pixel_indices) == 0:
+                continue
+                
+            vis_indices = vis_pixel_indices[:, 0] * w + vis_pixel_indices[:, 1]
+            face_ids = self.face_id_map[vis_pixel_indices[:, 0], vis_pixel_indices[:, 1]]
+
+            nid_info = self.ci.get_frame_info(nid)
+
+            for idx, face_id in zip(vis_indices, face_ids):
+                if idx in idx_to_pos:
+                    nid_image_id = nid_info['image_ids'][face_id]
+                    if nid_image_id in colmap_to_mvs_image:
+                        mvs_img_id = colmap_to_mvs_image[nid_image_id]
+                        point_visibility[idx_to_pos[idx]].append(mvs_img_id)
+
+            points_vis = points[vlayer]
+            # project the visible points to the neighbor frame & mark them as exported
+            uvd = world_points_to_uvd_in_spherical(points_vis, self.ci.get_frame_info(nid), w)
+            iu = uvd[:, 0].astype(int)
+            iv = uvd[:, 1].astype(int)
+            neighbor_depth_data = self.depth_data[nid]
+            neighbor_depth_data.exported_mask[iv, iu] = True
+
+        # Append vertices directly to scene_data
+        vertices = scene_data["vertices"]
+        vertices_color = scene_data["verticesColor"]
+        
+        for i in range(n_points):
+            xyz = points_valid[i].tolist()
+            
+            # Build views from visibility (remove duplicates)
+            seen_mvs_ids = set(point_visibility[i])
+            views = [{"imageID": mvs_id, "confidence": 1.0} for mvs_id in seen_mvs_ids]
+            
+            vertex = {"X": xyz, "views": views}
+            vertices.append(vertex)
+            
+            # Convert RGB to BGR for MVS format
+            rgb = colors[i]
+            color = {"c": [int(rgb[2]), int(rgb[1]), int(rgb[0])]}
+            vertices_color.append(color)
+        
+        return n_points
+
+    def export_scene_data(self) -> dict:
+        """
+        Export all depth data directly to scene_data format.
+        
+        This is memory-efficient as it builds vertices directly into scene_data
+        without intermediate point_dict storage.
+        
+        Returns:
+            dict: scene_data dictionary compatible with SceneInterface.save()
+        """
+        # Initialize scene_data with platforms and images
+        scene_data, colmap_to_mvs_image = self._init_scene_data()
+        
+        # Export each frame's points directly to scene_data
+        total_points = 0
+        for fid in tqdm(self.depth_data, desc="Exporting to scene data"):
+            n_points = self._export_frame_to_scene(fid, scene_data, colmap_to_mvs_image)
+            total_points += n_points
+        
+        print(f"Exported {total_points} points to scene data")
         return scene_data
 
 
@@ -1073,14 +1142,7 @@ if __name__ == "__main__":
             img_name = validation_manager.depth_data[fid].image_name()
             save_point_cloud(points, colors, conf['out_pts'] / f"{img_name}-validated.ply")
 
-    point_dicts = validation_manager.export_point_cloud()
-
-    points, colors = validation_manager.extract_points_and_colors(point_dicts)
-    save_point_cloud(points, colors, conf['out_folder'] / "scene_dense.ply")
-
-    scene_data = validation_manager.build_scene_data(point_dicts)
+    # Export directly to scene_data (memory-efficient)
+    scene_data = validation_manager.export_scene_data()
     SceneInterface.save(conf['out_folder'] / "scene_dense.mvs", scene_data)
-
-    # points, colors = filter_point_cloud(points, colors)
-    # save_point_cloud(points, colors, conf['out_folder'] / "scene_dense_filtered.ply")
 
