@@ -11,9 +11,6 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(PROJECT_ROOT)
 sys.path.append(os.path.join(PROJECT_ROOT, 'test'))
 
-from infer_dataset import load_image
-from infer_dataset import depth_map_to_cam_points
-from infer_dataset import save_point_cloud
 try:
     import infer as infer_module
     load_model = infer_module.load_model
@@ -26,6 +23,17 @@ except ImportError:
     infer_raw = infer_module.infer_raw
     pred_to_vis = infer_module.pred_to_vis
 
+def load_image(img_path: Path, width: int, height: int):
+    if not img_path.exists():
+        print(f"⚠️ Image not found: {img_path}")
+        return None
+    img_bgr = cv2.imread(str(img_path))
+    if img_bgr is None:
+        print(f"⚠️ Cannot read image: {img_path}")
+        return None
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    img_input = cv2.resize(img_rgb, (width, height), interpolation=cv2.INTER_LINEAR)
+    return img_input
 
 def process_dataset(conf: dict):
 
@@ -84,12 +92,11 @@ def process_dataset(conf: dict):
                 vis_path = os.path.join(out_depth_vis, f"{img_name}.png")
                 cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
 
-                cam_points = depth_map_to_cam_points(pred_depth)
-                mask = pred_depth > 0
-                cam_points = cam_points[mask].reshape(-1,3)
-                colors  = img_inputs[i][mask].reshape(-1,3)
-
-                save_point_cloud(cam_points, colors, out_pts / f"{img_name}-raw.ply")
+                # cam_points = depth_map_to_cam_points(pred_depth)
+                # mask = pred_depth > 0
+                # cam_points = cam_points[mask].reshape(-1,3)
+                # colors  = img_inputs[i][mask].reshape(-1,3)
+                # save_point_cloud(cam_points, colors, out_pts / f"{img_name}-raw.ply")
 
 
 if __name__ == "__main__":

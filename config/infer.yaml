@@ -8,7 +8,7 @@ model:
     train_decoder: True
 
 median_align: False
-load_weights_dir: /home/tola/code/reference/DAP/checkpoints/
+load_weights_dir: checkpoints/
 input:
   height: 512
   width: 1024
