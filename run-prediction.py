@@ -4,24 +4,13 @@ import yaml
 from tqdm import tqdm
 import cv2
 import os
-import sys
 import numpy as np
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(PROJECT_ROOT)
-sys.path.append(os.path.join(PROJECT_ROOT, 'test'))
+from ddpy_dap import infer as infer_module
 
-try:
-    import infer as infer_module
-    load_model = infer_module.load_model
-    infer_raw = infer_module.infer_raw
-    pred_to_vis = infer_module.pred_to_vis
-except ImportError:
-    # Fallback if test is treated as a package
-    from test import infer as infer_module
-    load_model = infer_module.load_model
-    infer_raw = infer_module.infer_raw
-    pred_to_vis = infer_module.pred_to_vis
+load_model = infer_module.load_model
+infer_raw = infer_module.infer_raw
+pred_to_vis = infer_module.pred_to_vis
 
 def load_image(img_path: Path, width: int, height: int):
     if not img_path.exists():

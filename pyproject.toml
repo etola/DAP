@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddpy-dap"
+version = "0.1.0"
+description = "DAP depth prediction library"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "DAP Contributors" }
+]
+dependencies = [
+  "einops",
+  "gradio==4.36.0",
+  "gradio_imageslider",
+  "huggingface_hub",
+  "matplotlib",
+  "mmengine",
+  "numpy",
+  "opencv-python",
+  "open3d",
+  "pyexr",
+  "pyyaml",
+  "safetensors",
+  "tensorboardX",
+  "torch",
+  "torchmetrics",
+  "torchvision",
+  "tornado==6.5.2",
+  "tqdm",
+]
+
+[tool.setuptools]
+include-package-data = true
+py-modules = [
+  "depth2normal",
+  "depth2point",
+  "depth_anything_utils",
+  "erp2cubemap",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+namespaces = true

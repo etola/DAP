@@ -1,23 +1,19 @@
 from __future__ import absolute_import, division, print_function
 
-import os
-import sys
-import cv2
-import torch
-import yaml
 import argparse
+import os
+
+import cv2
+import matplotlib
 import numpy as np
+import torch
 import torch.nn as nn
+import yaml
 from tqdm import tqdm
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(PROJECT_ROOT)
-
 from depth2point import depth2pointcloud_numpy
-
 from networks.models import make  # Recommend using make instead of import *
 
-import matplotlib
 
 def colorize_depth_fixed(depth_u8: np.ndarray, cmap: str = "Spectral") -> np.ndarray:
     """
@@ -29,8 +25,10 @@ def colorize_depth_fixed(depth_u8: np.ndarray, cmap: str = "Spectral") -> np.nda
     colored = (colored * 255).astype(np.uint8)
     return np.ascontiguousarray(colored)
 
+
 def ensure_dir_for_file(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+
 
 def load_model(config):
     model_path = os.path.join(config["load_weights_dir"], "model.pth")
@@ -50,6 +48,7 @@ def load_model(config):
 
     print("✅ Model loaded successfully.\n")
     return m, device
+
 
 def infer_raw(model, device, img_rgb_u8: np.ndarray) -> np.ndarray:
     """
@@ -85,6 +84,7 @@ def infer_raw(model, device, img_rgb_u8: np.ndarray) -> np.ndarray:
 
     return pred
 
+
 def pred_to_vis(pred: np.ndarray, vis_range: str = "100m", cmap: str = "Spectral"):
     """
     return:
@@ -102,6 +102,7 @@ def pred_to_vis(pred: np.ndarray, vis_range: str = "100m", cmap: str = "Spectral
 
     depth_color = colorize_depth_fixed(depth_gray, cmap=cmap)
     return depth_gray, depth_color
+
 
 def infer_and_save(model, device, img_path, out_root, idx, vis_range="100m", cmap="Spectral"):
     img_bgr = cv2.imread(img_path)
@@ -138,7 +139,6 @@ def infer_and_save(model, device, img_path, out_root, idx, vis_range="100m", cma
     depth2pointcloud_numpy(pred, img_rgb, os.path.join(out_root, "pts", filename + ".ply"))
 
 
-
 def main(config_path, txt_path, out_root, vis_range="100m", cmap="Spectral"):
     with open(config_path, "r") as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
@@ -158,6 +158,7 @@ def main(config_path, txt_path, out_root, vis_range="100m", cmap="Spectral"):
     print(f"   depth npy: {out_root}/depth_npy")
     print(f"   depth gray png: {out_root}/depth_vis_gray_{vis_range}")
     print(f"   depth color png: {out_root}/depth_vis_color_{vis_range}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

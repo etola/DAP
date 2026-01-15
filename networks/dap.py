@@ -1,3 +1,6 @@
+import importlib
+from pathlib import Path
+
 import torch
 import numpy as np
 from einops import rearrange
@@ -29,7 +32,13 @@ class DAP(nn.Module):
         }
         
         # Load the pretrained model of depth anything
-        dinov3_repo_dir="./depth_anything_v2_metric/depth_anything_v2/dinov3"     # Your local repo
+        # Resolve local dinov3 path from installed package if available.
+        try:
+            depth_anything_pkg = importlib.import_module("depth_anything_v2_metric")
+            depth_anything_root = Path(next(iter(depth_anything_pkg.__path__)))
+            dinov3_repo_dir = str(depth_anything_root / "depth_anything_v2" / "dinov3")
+        except Exception:
+            dinov3_repo_dir = "./depth_anything_v2_metric/depth_anything_v2/dinov3"  # Local repo fallback
         dinov3_arch="dinov3_vitl16"          
         dinov3_weight=""
 
