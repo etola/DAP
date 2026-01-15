@@ -26,26 +26,15 @@ def load_image(img_path: Path, width: int, height: int):
 
 def process_dataset(conf: dict):
 
-    dataset_folder = conf["dataset"]
+    ml_dmap_folder = conf["ml_dmap_folder"]
+    ml_dmap_folder.mkdir(parents=True, exist_ok=True)
 
-    out_folder = dataset_folder / "outfolder"
-    out_folder.mkdir(parents=True, exist_ok=True)
-
-    dmap_folder = out_folder / "pred_dmaps"
-    dmap_folder.mkdir(parents=True, exist_ok=True)
-
-    # expecting keyframes folder for equirectangular images
-    keyframes_folder = dataset_folder / "keyframes"
-    if not keyframes_folder.exists():
-        raise FileNotFoundError(f"Keyframes folder not found: {keyframes_folder}")
+    # expecting image folder for equirectangular images
+    image_folder = conf["image_folder"]
+    if not image_folder.exists():
+        raise FileNotFoundError(f"Image folder not found: {image_folder}")
 
     depth_scale = 10 if conf["vis"] == "10m" else 100
-
-    if conf["save_visualization"]:
-        out_depth_vis = out_folder / "depth_vis"
-        out_depth_vis.mkdir(parents=True, exist_ok=True)
-        out_pts = out_folder / "pts"
-        out_pts.mkdir(parents=True, exist_ok=True)
 
     # Load Config and Model
     with open(conf["config"], "r") as f:
@@ -74,11 +63,11 @@ def process_dataset(conf: dict):
         for i in range(len(img_batch)):
             pred_depth = pred_depths[i] * depth_scale
             img_name = img_batch[i].name.split('.')[0]
-            np.save(dmap_folder / f"{img_name}.npy", pred_depth)
+            np.save(ml_dmap_folder / f"{img_name}.npy", pred_depth)
 
             if conf["save_visualization"]:
                 _, depth_color_rgb = pred_to_vis(pred_depth, vis_range=conf["vis"], cmap=conf["cmap"])
-                vis_path = os.path.join(out_depth_vis, f"{img_name}.png")
+                vis_path = os.path.join(ml_dmap_folder, f"{img_name}.png")
                 cv2.imwrite(vis_path, cv2.cvtColor(depth_color_rgb, cv2.COLOR_RGB2BGR))
 
                 # cam_points = depth_map_to_cam_points(pred_depth)
@@ -93,20 +82,27 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
     parser.add_argument("--image_folder", "-i", type=Path, default="keyframes", help="Path to the image folder relative to dataset. default [keyframes]")
     parser.add_argument("--output", "-o", type=Path, default="outfolder", help="Path to the output folder relative to dataset. default [outfolder]")
-    parser.add_argument("--config", default="config/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
+    parser.add_argument("--config", '-c', default="dap/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
     parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range, default [10m]")
     parser.add_argument("--cmap", default="Spectral", help="Colormap name, e.g. default [Spectral], Turbo, Viridis")
     parser.add_argument("--save_visualization", "-v", action="store_true", help="Save visualizations (default: False) saves dmap and pointcloud")
     parser.add_argument("--infer_width", type=int, default=1024, help="Inference width, default [1024]")
-    parser.add_argument("--batch_size", "-b", type=int, default=1, help="Batch size, default [1]")
+    parser.add_argument("--batch_size", "-b", type=int, default=12, help="Batch size, default [12]")
 
     args = parser.parse_args()
+
+    # if image_folder is an absolute path, use it as is
+    if args.image_folder.is_absolute():
+        image_folder = args.image_folder
+    else:
+        image_folder = (args.dataset / args.image_folder).resolve()
 
     conf = {
         "dataset": args.dataset,
         "out_folder": args.dataset / args.output,
-        "image_folder": args.dataset / args.image_folder,
-        "infer_width": 1024,
+        "ml_dmap_folder": args.dataset / args.output / "ml_dmaps",
+        "image_folder": image_folder,
+        "infer_width": args.infer_width,
         "config": args.config,
         "vis": args.vis,
         "cmap": args.cmap,
