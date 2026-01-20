@@ -81,7 +81,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
     parser.add_argument("--image_folder", "-i", type=Path, default="keyframes", help="Path to the image folder relative to dataset. default [keyframes]")
-    parser.add_argument("--output", "-o", type=Path, default="outfolder", help="Path to the output folder relative to dataset. default [outfolder]")
+    parser.add_argument("--output", "-o", type=Path, default="./", help="Path to the output folder relative to dataset. default [./]")
     parser.add_argument("--config", '-c', default="dap/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
     parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range, default [10m]")
     parser.add_argument("--cmap", default="Spectral", help="Colormap name, e.g. default [Spectral], Turbo, Viridis")
@@ -97,10 +97,15 @@ if __name__ == "__main__":
     else:
         image_folder = (args.dataset / args.image_folder).resolve()
 
+    if args.output.is_absolute():
+        output_folder = args.output
+    else:
+        output_folder = (args.dataset / args.output).resolve()
+
     conf = {
         "dataset": args.dataset,
-        "out_folder": args.dataset / args.output,
-        "ml_dmap_folder": args.dataset / args.output / "ml_dmaps",
+        "out_folder": output_folder,
+        "ml_dmap_folder": output_folder / "ml_dmaps",
         "image_folder": image_folder,
         "infer_width": args.infer_width,
         "config": args.config,
