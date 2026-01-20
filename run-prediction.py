@@ -82,7 +82,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", "-d", type=Path, help="Path to the dataset folder")
     parser.add_argument("--image_folder", "-i", type=Path, default="keyframes", help="Path to the image folder relative to dataset. default [keyframes]")
     parser.add_argument("--output", "-o", type=Path, default="./", help="Path to the output folder relative to dataset. default [./]")
-    parser.add_argument("--config", '-c', default="dap/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
+    parser.add_argument("--config", '-c', default="config/infer.yaml", help="Path to inference config, default [config/infer.yaml]")
     parser.add_argument("--vis", default="10m", choices=["100m", "10m"], help="Visualization range, default [10m]")
     parser.add_argument("--cmap", default="Spectral", help="Colormap name, e.g. default [Spectral], Turbo, Viridis")
     parser.add_argument("--save_visualization", "-v", action="store_true", help="Save visualizations (default: False) saves dmap and pointcloud")
